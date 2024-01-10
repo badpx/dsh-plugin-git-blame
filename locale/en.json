@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Git Blame on Hover",
+    "description": "Hover a source line in a right-sidebar file preview to see its git blame author, commit and summary."
+  }
+}

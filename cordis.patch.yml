@@ -1,0 +1,3 @@
+- insert:
+    - id: git-blame-hover
+      name: '@local/dsh-git-blame-hover'

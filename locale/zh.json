@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Git Blame 悬停提示",
+    "description": "在右侧栏的文件预览中悬停某一行源码，即可查看该行的 Git Blame 作者、提交与摘要。"
+  }
+}
