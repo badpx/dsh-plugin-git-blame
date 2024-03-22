@@ -73,42 +73,19 @@ window.__ModuleLoader__.load({
       return undefined;
     }
 
-    /** Resolve the previewed file (session + workspace path) from the hovered line. */
-    function fileAt(ctx, element) {
-      let sidebarRight;
-      try {
-        sidebarRight = ctx.sidebarRight || (typeof ctx.get === 'function' ? ctx.get('sidebarRight') : undefined);
-      } catch (_error) {
-        sidebarRight = undefined;
-      }
-      if (!sidebarRight) return undefined;
-
-      const sessionEl = element.closest('[data-sidebar-right-session]');
-      const tabEl = element.closest('[data-sidebar-right-tab]');
-      if (!sessionEl) return undefined;
-      const sessionId = sessionEl.dataset.sidebarRightSession;
-      const tabId = tabEl && tabEl.dataset.sidebarRightTab;
-      if (!sessionId) return undefined;
-
-      let tab;
-      try {
-        const tabs = sidebarRight.tabsIn(sessionId) || [];
-        tab = tabId === undefined ? undefined : tabs.find((candidate) => candidate.id === tabId);
-      } catch (_error) {
-        tab = undefined;
-      }
-      if (!tab && typeof sidebarRight.active === 'function') {
-        try {
-          tab = sidebarRight.active();
-        } catch (_error) {
-          tab = undefined;
-        }
-      }
-      if (!tab || typeof tab.contentId !== 'string') return undefined;
-
-      const parsed = parseFileAddress(tab.contentId);
+    /**
+     * Resolve the previewed file (session + workspace path) from the hovered line.
+     * The preview container publishes its own `dsh-resource://file/...` address on
+     * `data-textpreview-url`, so no sidebar service lookup is required.
+     */
+    function fileAt(element) {
+      const preview = element.closest('[data-textpreview-url]');
+      if (!preview) return undefined;
+      const contentId = preview.dataset.textpreviewUrl;
+      if (typeof contentId !== 'string' || contentId === '') return undefined;
+      const parsed = parseFileAddress(contentId);
       if (!parsed || parsed.scope !== 'session') return undefined;
-      return { sessionId: parsed.sessionId, path: parsed.path, contentId: tab.contentId };
+      return { sessionId: parsed.sessionId, path: parsed.path, contentId };
     }
 
     function buildUrl(sessionId, filePath, line) {
@@ -190,7 +167,6 @@ window.__ModuleLoader__.load({
         const [tip, setTip] = React.useState(null);
         const tipRef = React.useRef(null);
         const cacheRef = React.useRef(new Map());
-        const rafRef = React.useRef(0);
         const timerRef = React.useRef(0);
         const seqRef = React.useRef(0);
         const lastKeyRef = React.useRef('');
@@ -201,11 +177,27 @@ window.__ModuleLoader__.load({
             setTip(next);
           };
 
+          let hideTimer = 0;
+
           const hide = () => {
+            clearTimeout(hideTimer);
+            hideTimer = 0;
             clearTimeout(timerRef.current);
             if (tipRef.current !== null) {
               lastKeyRef.current = '';
               publish(null);
+            }
+          };
+
+          const scheduleHide = () => {
+            clearTimeout(hideTimer);
+            hideTimer = setTimeout(hide, 140);
+          };
+
+          const cancelHide = () => {
+            if (hideTimer !== 0) {
+              clearTimeout(hideTimer);
+              hideTimer = 0;
             }
           };
 
@@ -236,19 +228,20 @@ window.__ModuleLoader__.load({
 
           const process = (x, y, target) => {
             if (!(target instanceof Element)) {
-              hide();
+              scheduleHide();
               return;
             }
             const line = lineAt(target);
             if (line === undefined) {
-              hide();
+              scheduleHide();
               return;
             }
-            const file = fileAt(ctx, target);
+            const file = fileAt(target);
             if (!file) {
-              hide();
+              scheduleHide();
               return;
             }
+            cancelHide();
             const key = `${file.contentId}#${line}`;
             const current = tipRef.current;
 
@@ -271,15 +264,12 @@ window.__ModuleLoader__.load({
             }, FETCH_DELAY_MS);
           };
 
-          const onPointerMove = (event) => {
-            const x = event.clientX;
-            const y = event.clientY;
-            const target = event.target;
-            if (rafRef.current !== 0) return;
-            rafRef.current = requestAnimationFrame(() => {
-              rafRef.current = 0;
-              process(x, y, target);
-            });
+          let lastMoveAt = 0;
+          const onMove = (event) => {
+            const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+            if (now - lastMoveAt < 16) return;
+            lastMoveAt = now;
+            process(event.clientX, event.clientY, event.target);
           };
 
           const onScroll = () => hide();
@@ -287,17 +277,19 @@ window.__ModuleLoader__.load({
             if (event.key === 'Escape') hide();
           };
 
-          document.addEventListener('pointermove', onPointerMove, { passive: true });
+          document.addEventListener('pointermove', onMove, { passive: true });
+          document.addEventListener('mousemove', onMove, { passive: true });
           document.addEventListener('scroll', onScroll, true);
           document.addEventListener('keydown', onKeyDown, true);
           window.addEventListener('blur', hide);
 
           return () => {
-            document.removeEventListener('pointermove', onPointerMove);
+            document.removeEventListener('pointermove', onMove);
+            document.removeEventListener('mousemove', onMove);
             document.removeEventListener('scroll', onScroll, true);
             document.removeEventListener('keydown', onKeyDown, true);
             window.removeEventListener('blur', hide);
-            if (rafRef.current !== 0) cancelAnimationFrame(rafRef.current);
+            clearTimeout(hideTimer);
             clearTimeout(timerRef.current);
           };
         }, []);
