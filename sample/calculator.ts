@@ -22,3 +22,8 @@ export function scale(point: Point, factor: number): Point {
 export function magnitude(point: Point): number {
   return Math.sqrt(point.x * point.x + point.y * point.y);
 }
+
+/** Clamp a value into an inclusive range. */
+export function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
