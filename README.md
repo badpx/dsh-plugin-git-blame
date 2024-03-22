@@ -20,6 +20,11 @@ sidebar's file preview, hovering a line shows a small card with that line's
 
 - The preview is read-only, so the interaction uses the mouse pointer rather
   than a text caret.
+- Rest on a line for ~0.5 s and the bubble appears. Once shown it stays while
+  the pointer remains inside the right-sidebar column (it follows onto other
+  lines), and disappears ~0.5 s after the pointer leaves that column.
+- The card is slightly translucent (opacity 0.94) so the code underneath stays
+  readable.
 - Results are cached per file+line for the lifetime of the page.
 - Files outside a Git repository, or lines that are not tracked, show a short
   explanatory message instead of a commit.

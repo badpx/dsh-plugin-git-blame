@@ -15,6 +15,8 @@ window.__ModuleLoader__.load({
 
     const FILE_PREFIX = 'dsh-resource://file/';
     const FETCH_DELAY_MS = 110;
+    const DWELL_DELAY_MS = 500;
+    const LEAVE_DELAY_MS = 500;
     const CARD_WIDTH = 360;
 
     /** Parse a `dsh-resource://file/...` address into session + path. */
@@ -178,10 +180,23 @@ window.__ModuleLoader__.load({
           };
 
           let hideTimer = 0;
+          let dwellTimer = 0;
+          let dwellKey = '';
+          let dwellFile = null;
+          let dwellLine = 0;
+          let dwellX = 0;
+          let dwellY = 0;
+
+          const clearDwell = () => {
+            clearTimeout(dwellTimer);
+            dwellTimer = 0;
+            dwellKey = '';
+          };
 
           const hide = () => {
             clearTimeout(hideTimer);
             hideTimer = 0;
+            clearDwell();
             clearTimeout(timerRef.current);
             if (tipRef.current !== null) {
               lastKeyRef.current = '';
@@ -191,7 +206,7 @@ window.__ModuleLoader__.load({
 
           const scheduleHide = () => {
             clearTimeout(hideTimer);
-            hideTimer = setTimeout(hide, 140);
+            hideTimer = setTimeout(hide, LEAVE_DELAY_MS);
           };
 
           const cancelHide = () => {
@@ -226,42 +241,76 @@ window.__ModuleLoader__.load({
               });
           };
 
-          const process = (x, y, target) => {
-            if (!(target instanceof Element)) {
-              scheduleHide();
-              return;
-            }
-            const line = lineAt(target);
-            if (line === undefined) {
-              scheduleHide();
-              return;
-            }
-            const file = fileAt(target);
-            if (!file) {
-              scheduleHide();
-              return;
-            }
-            cancelHide();
-            const key = `${file.contentId}#${line}`;
-            const current = tipRef.current;
-
-            if (current && current.key === key) {
-              if (current.x !== x || current.y !== y) publish({ ...current, x, y });
-              return;
-            }
-
-            lastKeyRef.current = key;
+          const showLine = (key, file, line, x, y) => {
             const cached = cacheRef.current.get(key);
             if (cached) {
               publish({ key, x, y, line, status: 'ok', data: cached });
               return;
             }
-
             publish({ key, x, y, line, status: 'loading' });
             clearTimeout(timerRef.current);
             timerRef.current = setTimeout(() => {
               if (tipRef.current && tipRef.current.key === key) fetchBlame(key, file, line);
             }, FETCH_DELAY_MS);
+          };
+
+          const process = (x, y, target) => {
+            if (!(target instanceof Element)) {
+              clearDwell();
+              scheduleHide();
+              return;
+            }
+            // Leaving the right-sidebar column hides the bubble after LEAVE_DELAY_MS.
+            if (!target.closest('[data-sidebar-right-session]')) {
+              clearDwell();
+              scheduleHide();
+              return;
+            }
+            cancelHide();
+
+            const line = lineAt(target);
+            const file = line === undefined ? undefined : fileAt(target);
+            if (line === undefined || !file) {
+              // Inside the sidebar but not on a blamable line: stop a pending dwell and
+              // keep any already-visible bubble where it is.
+              clearDwell();
+              return;
+            }
+
+            const key = `${file.contentId}#${line}`;
+            const current = tipRef.current;
+            if (current && current.key === key) {
+              if (current.x !== x || current.y !== y) publish({ ...current, x, y });
+              return;
+            }
+
+            if (current) {
+              // Already visible: follow the pointer onto the next line immediately.
+              clearDwell();
+              showLine(key, file, line, x, y);
+              return;
+            }
+
+            // Not visible yet: require a DWELL_DELAY_MS rest on this line before showing.
+            if (dwellKey !== key) {
+              clearDwell();
+              dwellKey = key;
+            }
+            dwellFile = file;
+            dwellLine = line;
+            dwellX = x;
+            dwellY = y;
+            if (dwellTimer === 0) {
+              dwellTimer = setTimeout(() => {
+                dwellTimer = 0;
+                const pendingKey = dwellKey;
+                if (pendingKey === '' || !dwellFile) return;
+                const shown = tipRef.current;
+                if (shown && shown.key === pendingKey) return;
+                showLine(pendingKey, dwellFile, dwellLine, dwellX, dwellY);
+                dwellKey = '';
+              }, DWELL_DELAY_MS);
+            }
           };
 
           let lastMoveAt = 0;
@@ -290,6 +339,7 @@ window.__ModuleLoader__.load({
             document.removeEventListener('keydown', onKeyDown, true);
             window.removeEventListener('blur', hide);
             clearTimeout(hideTimer);
+            clearDwell();
             clearTimeout(timerRef.current);
           };
         }, []);
@@ -312,6 +362,7 @@ window.__ModuleLoader__.load({
             padding: '8px 10px',
             pointerEvents: 'none',
             zIndex: 2147483000,
+            opacity: 0.94,
             background: 'var(--dsw-alias-bg-layer-2)',
             color: 'var(--dsw-alias-label-primary)',
             border: '0.5px solid var(--dsw-alias-border-l3)',
