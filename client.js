@@ -98,70 +98,95 @@ window.__ModuleLoader__.load({
       return url.href;
     }
 
+    /** Fixed-width, tabular line number so the rest of the row never shifts. */
+    const lineBadgeStyle = {
+      flex: 'none',
+      minWidth: '5ch',
+      display: 'inline-block',
+      textAlign: 'right',
+      fontFamily: 'var(--dsw-font-mono, ui-monospace, monospace)',
+      fontSize: '11px',
+      fontVariantNumeric: 'tabular-nums',
+      color: 'var(--dsw-alias-label-tertiary)',
+    };
+
+    /** Top section: #line, short SHA, date, author. */
+    function renderTopLine(tip, data) {
+      return h('div', {
+        style: { display: 'flex', alignItems: 'baseline', gap: '8px', minWidth: 0, whiteSpace: 'nowrap' },
+      },
+      h('span', { style: lineBadgeStyle }, `#${tip.line}`),
+      h('span', {
+        style: {
+          flex: 'none',
+          fontFamily: 'var(--dsw-font-mono, ui-monospace, monospace)',
+          fontSize: '11px',
+          color: 'var(--dsw-alias-label-secondary)',
+        },
+      }, data.shortSha || ''),
+      h('span', { style: { flex: 'none', fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } }, data.date || ''),
+      h('span', {
+        title: data.authorMail || undefined,
+        style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', fontSize: '12px', fontWeight: 600 },
+      }, data.author || 'Unknown author'));
+    }
+
     /** The floating card content. */
     function renderCard(tip) {
-      const body = { display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 };
 
       if (tip.status === 'loading') {
-        return h('div', { style: body },
-          h('div', { style: { fontWeight: 600, fontSize: '12px' } }, 'Reading git blame…'),
-          h('div', { style: { color: 'var(--dsw-alias-label-secondary)', fontSize: '11px' } }, `line ${tip.line}`));
+        return h('div', { style: { display: 'flex', alignItems: 'baseline', gap: '8px', minWidth: 0 } },
+          h('span', { style: lineBadgeStyle }, `#${tip.line}`),
+          h('span', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' } }, 'Reading git blame…'));
       }
 
       if (tip.status === 'error') {
-        return h('div', { style: body },
-          h('div', { style: { fontWeight: 600, fontSize: '12px' } }, 'Git blame unavailable'),
-          h('div', { style: { color: 'var(--dsw-alias-label-secondary)', fontSize: '11px', whiteSpace: 'normal' } },
-            tip.message || 'Unknown error'));
+        return h('div', { style: { display: 'flex', alignItems: 'baseline', gap: '8px', minWidth: 0 } },
+          h('span', { style: lineBadgeStyle }, `#${tip.line}`),
+          h('span', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', whiteSpace: 'normal' } },
+            tip.message || 'Git blame unavailable'));
       }
 
       const data = tip.data || {};
-      const sha = h('span', {
-        style: {
-          fontFamily: 'var(--dsw-font-mono, ui-monospace, monospace)',
-          fontSize: '11px',
-          color: 'var(--dsw-alias-label-tertiary)',
+      const title = data.title || data.summary || '';
+      const messageBody = data.body || '';
+
+      const message = (title || messageBody)
+        ? h('div', {
+          style: { marginTop: '3px', display: 'flex', flexDirection: 'column', gap: '1px', minWidth: 0 },
         },
-      }, data.shortSha || '');
-
-      const author = h('span', {
-        title: data.authorMail || undefined,
-        style: { fontWeight: 600, fontSize: '12px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-      }, data.author || 'Unknown author');
-
-      const meta = h('div', {
-        style: { display: 'flex', gap: '8px', alignItems: 'center', minWidth: 0 },
-      },
-      sha,
-      h('span', { style: { color: 'var(--dsw-alias-label-secondary)', fontSize: '11px' } }, data.date || ''),
-      data.uncommitted
-        ? h('span', {
-          style: {
-            fontSize: '10px',
-            padding: '0 5px',
-            borderRadius: 'var(--dsw-radius-sm)',
-            background: 'var(--dsw-alias-state-warn-tertiary)',
-            color: 'var(--dsw-alias-state-warn-label)',
-          },
-        }, 'uncommitted')
-        : null);
-
-      return h('div', { style: body },
-        meta,
-        author,
-        data.summary
+        title
           ? h('div', {
-            title: data.summary,
+            title: title,
             style: {
-              color: 'var(--dsw-alias-label-secondary)',
-              fontSize: '11px',
+              fontSize: '12px',
+              fontWeight: 700,
+              color: 'var(--dsw-alias-label-primary)',
               overflow: 'hidden',
               textOverflow: 'ellipsis',
               whiteSpace: 'nowrap',
             },
-          }, data.summary)
+          }, title)
           : null,
-        h('div', { style: { color: 'var(--dsw-alias-label-tertiary)', fontSize: '10px' } }, `line ${tip.line}`));
+        messageBody
+          ? h('div', {
+            title: messageBody,
+            style: {
+              fontSize: '12px',
+              color: 'var(--dsw-alias-label-secondary)',
+              whiteSpace: 'pre-wrap',
+              overflow: 'hidden',
+              display: '-webkit-box',
+              WebkitLineClamp: 5,
+              WebkitBoxOrient: 'vertical',
+            },
+          }, messageBody)
+          : null)
+        : null;
+
+      return h('div', { style: { display: 'flex', flexDirection: 'column', minWidth: 0 } },
+        renderTopLine(tip, data),
+        message);
     }
 
     function apply(ctx) {
@@ -359,7 +384,7 @@ window.__ModuleLoader__.load({
             top: `${top}px`,
             width: `${CARD_WIDTH}px`,
             boxSizing: 'border-box',
-            padding: '8px 10px',
+            padding: '6px 10px',
             pointerEvents: 'none',
             zIndex: 2147483000,
             opacity: 0.94,

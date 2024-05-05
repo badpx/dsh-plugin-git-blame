@@ -4,7 +4,8 @@
  * It registers one HTTP route the Web client calls while the pointer rests on a
  * source line inside the right-sidebar file preview. The route resolves the
  * Session's working directory, runs `git blame --line-porcelain` for exactly
- * that line, and answers with small JSON describing the commit.
+ * that line, then reads the full commit message, and answers with small JSON
+ * describing the commit.
  */
 import path from 'node:path';
 
@@ -17,10 +18,14 @@ export const inject = ['webServer', 'sessions', 'workingDirectory', 'subprocess'
 /** Bound every git invocation so a stuck repository cannot pin a request. */
 const GIT_TIMEOUT_MS = 8000;
 
+/** Small cache of commit messages, keyed by full SHA. */
+const MESSAGE_CACHE_LIMIT = 500;
+const messageCache = new Map();
+
 /**
  * @param {import('node:http').IncomingMessage} req
  * @param {import('node:http').ServerResponse} res
- * @param {{ status: number, body: unknown }} reply
+ * @param {unknown} body
  */
 function sendJson(res, status, body) {
   const text = JSON.stringify(body);
@@ -44,6 +49,68 @@ function resolveFile(ctx, session, requestedPath) {
   const root = path.resolve(cwd);
   if (absolute !== root && !absolute.startsWith(root + path.sep)) return undefined;
   return absolute;
+}
+
+/**
+ * Run one managed git command and collect its output.
+ * @returns {Promise<{ ok: boolean, exitCode?: number | null, stdout: string, stderr: string, message?: string }>}
+ */
+async function runGit(ctx, cwd, argv) {
+  let handle;
+  try {
+    handle = ctx.subprocess.spawn({
+      argv,
+      cwd,
+      stdio: {
+        stdin: 'ignore',
+        stdout: { maxBytes: 1024 * 1024 },
+        stderr: { maxBytes: 64 * 1024 },
+      },
+      graceMs: GIT_TIMEOUT_MS,
+    });
+  } catch (error) {
+    return { ok: false, stdout: '', stderr: '', message: String((error && error.message) || error) };
+  }
+
+  let outcome;
+  try {
+    outcome = await handle.done;
+  } catch (error) {
+    return { ok: false, stdout: '', stderr: '', message: String((error && error.message) || error) };
+  }
+
+  return {
+    ok: outcome.exitCode === 0,
+    exitCode: outcome.exitCode,
+    stdout: handle.collected.stdout ? handle.collected.stdout.readFrom(0).text : '',
+    stderr: handle.collected.stderr ? handle.collected.stderr.readFrom(0).text : '',
+  };
+}
+
+/**
+ * Read one commit's full message (`%B`), cached by SHA.
+ * @returns {Promise<string>}
+ */
+async function commitMessage(ctx, cwd, sha) {
+  const cached = messageCache.get(sha);
+  if (cached !== undefined) return cached;
+  const result = await runGit(ctx, cwd, ['git', '-C', cwd, 'show', '-s', '--format=%B', sha]);
+  const message = result.ok ? result.stdout.replace(/\s+$/, '') : '';
+  if (messageCache.size >= MESSAGE_CACHE_LIMIT) messageCache.clear();
+  messageCache.set(sha, message);
+  return message;
+}
+
+/**
+ * Split a commit message into its first-line title and remaining body.
+ * @returns {{ title: string, body: string }}
+ */
+function splitMessage(message, fallbackTitle) {
+  const text = (message || '').trim();
+  if (text === '') return { title: fallbackTitle || '', body: '' };
+  const newline = text.indexOf('\n');
+  if (newline === -1) return { title: text, body: '' };
+  return { title: text.slice(0, newline).trim(), body: text.slice(newline + 1).trim() };
 }
 
 /**
@@ -87,51 +154,25 @@ function parsePorcelain(text) {
     const d = new Date(info.time * 1000);
     if (!Number.isNaN(d.getTime())) info.date = d.toISOString().slice(0, 10);
   }
-  if (uncommitted) {
-    info.author = info.author || 'Uncommitted change';
-    info.summary = info.summary || 'Working tree changes not yet committed';
-  }
   return info;
 }
 
 /**
- * Run git blame for one line and return its parsed or failed outcome.
+ * Run git blame for one line, then attach the commit message title/body.
  * @returns {Promise<Record<string, unknown>>}
  */
 async function blameLine(ctx, cwd, absolutePath, line) {
-  const argv = [
+  const result = await runGit(ctx, cwd, [
     'git', '-C', cwd,
     'blame', '--line-porcelain', '-L', `${line},${line}`, '--', absolutePath,
-  ];
+  ]);
 
-  let handle;
-  try {
-    handle = ctx.subprocess.spawn({
-      argv,
-      cwd,
-      stdio: {
-        stdin: 'ignore',
-        stdout: { maxBytes: 1024 * 1024 },
-        stderr: { maxBytes: 64 * 1024 },
-      },
-      graceMs: GIT_TIMEOUT_MS,
-    });
-  } catch (error) {
-    return { ok: false, code: 'spawn-failed', message: String((error && error.message) || error) };
+  if (result.exitCode === undefined) {
+    return { ok: false, code: 'spawn-failed', message: result.message };
   }
 
-  let outcome;
-  try {
-    outcome = await handle.done;
-  } catch (error) {
-    return { ok: false, code: 'git-failed', message: String((error && error.message) || error) };
-  }
-
-  const stdout = handle.collected.stdout ? handle.collected.stdout.readFrom(0).text : '';
-  const stderr = handle.collected.stderr ? handle.collected.stderr.readFrom(0).text : '';
-
-  if (outcome.exitCode !== 0) {
-    const message = stderr.trim() || stdout.trim() || 'git blame failed';
+  if (!result.ok) {
+    const message = result.stderr.trim() || result.stdout.trim() || 'git blame failed';
     if (/not a git repository/i.test(message)) {
       return { ok: false, code: 'not-repo', message: 'This file is not inside a Git repository' };
     }
@@ -141,7 +182,22 @@ async function blameLine(ctx, cwd, absolutePath, line) {
     return { ok: false, code: 'git-failed', message: message.split('\n')[0] };
   }
 
-  return parsePorcelain(stdout);
+  const info = parsePorcelain(result.stdout);
+  if (!info.ok) return info;
+
+  if (info.uncommitted) {
+    info.author = info.author || 'Uncommitted change';
+    info.message = '';
+    info.title = 'Uncommitted change';
+    info.body = 'Working tree changes not yet committed';
+    return info;
+  }
+
+  info.message = await commitMessage(ctx, cwd, info.sha);
+  const split = splitMessage(info.message, info.summary);
+  info.title = split.title;
+  info.body = split.body;
+  return info;
 }
 
 /**
