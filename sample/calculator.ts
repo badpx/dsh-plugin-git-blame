@@ -27,3 +27,8 @@ export function magnitude(point: Point): number {
 export function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
+
+/** Return the absolute value of a number. */
+export function absolute(value: number): number {
+  return Math.abs(value);
+}
