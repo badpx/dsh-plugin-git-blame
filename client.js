@@ -24,6 +24,8 @@ window.__ModuleLoader__.load({
     const CACHE_LIMIT = 2000;
     /** How long a probed file version is reused before re-probing. */
     const VERSION_TTL_MS = 1000;
+    /** Idle delay before the bubble fades to its dimmed opacity. */
+    const IDLE_DIM_MS = 9000;
 
     /** Parse a `dsh-resource://file/...` address into session + path. */
     function parseFileAddress(address) {
@@ -221,6 +223,7 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       function Overlay() {
         const [tip, setTip] = React.useState(null);
+        const [dimmed, setDimmed] = React.useState(false);
         const tipRef = React.useRef(null);
         const cacheRef = React.useRef(new Map());
         const versionRef = React.useRef(new Map());
@@ -236,12 +239,28 @@ window.__ModuleLoader__.load({
           };
 
           let hideTimer = 0;
+          let idleTimer = 0;
           let dwellTimer = 0;
           let dwellKey = '';
           let dwellFile = null;
           let dwellLine = 0;
           let dwellX = 0;
           let dwellY = 0;
+
+          const clearIdle = () => {
+            clearTimeout(idleTimer);
+            idleTimer = 0;
+          };
+
+          /** Reset the idle countdown and restore full opacity on any pointer activity. */
+          const notifyActivity = () => {
+            setDimmed((was) => (was ? false : was));
+            clearIdle();
+            idleTimer = setTimeout(() => {
+              idleTimer = 0;
+              if (tipRef.current !== null) setDimmed(true);
+            }, IDLE_DIM_MS);
+          };
 
           const clearDwell = () => {
             clearTimeout(dwellTimer);
@@ -252,6 +271,8 @@ window.__ModuleLoader__.load({
           const hide = () => {
             clearTimeout(hideTimer);
             hideTimer = 0;
+            clearIdle();
+            setDimmed((was) => (was ? false : was));
             clearDwell();
             clearTimeout(timerRef.current);
             showSeqRef.current += 1;
@@ -424,6 +445,7 @@ window.__ModuleLoader__.load({
             const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
             if (now - lastMoveAt < 16) return;
             lastMoveAt = now;
+            notifyActivity();
             process(event.clientX, event.clientY, event.target);
           };
 
@@ -445,6 +467,7 @@ window.__ModuleLoader__.load({
             document.removeEventListener('keydown', onKeyDown, true);
             window.removeEventListener('blur', hide);
             clearTimeout(hideTimer);
+            clearIdle();
             clearDwell();
             clearTimeout(timerRef.current);
           };
@@ -468,7 +491,8 @@ window.__ModuleLoader__.load({
             padding: '6px 10px',
             pointerEvents: 'none',
             zIndex: 2147483000,
-            opacity: 0.94,
+            opacity: dimmed ? 0.125 : 0.9,
+            transition: dimmed ? 'opacity 1s ease' : 'opacity 0.15s ease',
             background: 'var(--dsw-alias-bg-layer-2)',
             color: 'var(--dsw-alias-label-primary)',
             border: '0.5px solid var(--dsw-alias-border-l3)',
