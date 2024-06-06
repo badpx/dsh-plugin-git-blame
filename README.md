@@ -23,8 +23,8 @@ sidebar's file preview, hovering a line shows a small card with that line's
 - Rest on a line for ~0.5 s and the bubble appears. Once shown it stays while
   the pointer remains inside the right-sidebar column (it follows onto other
   lines), and disappears ~0.5 s after the pointer leaves that column.
-- The card is slightly translucent (opacity 0.9). After ~9 s without pointer
-  movement it fades over 1 s to opacity 0.125 so it stops hiding the code below;
+- The card is slightly translucent (opacity 0.8). After ~9 s without pointer
+  movement it fades over 1 s to opacity 0.2 so it stops hiding the code below;
   any pointer movement restores it.
 - The commit message is shown as a bold first-line title plus a normal body; the
   body is capped at 5 lines and ends with an ellipsis when truncated.
