@@ -32,3 +32,8 @@ export function clamp(value: number, min: number, max: number): number {
 export function absolute(value: number): number {
   return Math.abs(value);
 }
+
+/** Negate a number. */
+export function negate(value: number): number {
+  return -value;
+}
