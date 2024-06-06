@@ -16,9 +16,17 @@ sidebar's file preview, hovering a line shows a small card with that line's
   maps the hovered tab to its `dsh-resource://file/...` address, and asks the
   Host route for the blame of that line.
 
-A toggle button in the preview header turns the hover bubble on or off and
-remembers the choice. Both the toggle and the bubble only appear for files that
+A toggle button in the preview header turns the inline blame column on or off and
+remembers the choice. Both the toggle and the column only appear for files that
 are **text and tracked by Git**; untracked or binary files show neither.
+
+## Inline blame column
+
+For the built-in highlighted code preview the plugin injects a fixed-width
+gutter column just left of the line numbers. Each row shows `date + author`
+(truncated with an ellipsis), and rows are tinted by commit SHA so the same
+commit shares one colour. Hovering that column shows the blame bubble; hovering
+the code lines themselves shows nothing.
 
 A shortcut command **"显示/关闭 Git Blame 气泡"** is registered but left unbound;
 assign it a key in Settings → Shortcuts, and the current keycaps appear in the

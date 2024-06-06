@@ -126,6 +126,114 @@ window.__ModuleLoader__.load({
       return request;
     }
 
+    /* ------------------------------------------------------------------ *
+     * Inline blame gutter: injected into the built-in highlighted preview.
+     * ------------------------------------------------------------------ */
+
+    const GUTTER_WIDTH = 150;
+    const GUTTER_STYLE_ID = 'dsh-git-blame-gutter-style';
+    const GUTTER_CACHE_LIMIT = 100;
+    const gutterCache = new Map();
+
+    function buildFileBlameUrl(sessionId, filePath, version) {
+      const url = new URL('plugin/git-blame/file', document.baseURI);
+      url.searchParams.set('sessionId', sessionId);
+      url.searchParams.set('path', filePath);
+      if (version) url.searchParams.set('version', version);
+      return url.href;
+    }
+
+    async function fetchGutterLines(file) {
+      const key = `${file.contentId}@${file.version || ''}`;
+      const cached = gutterCache.get(key);
+      if (cached !== undefined) return cached;
+      let lines = [];
+      try {
+        const response = await fetch(buildFileBlameUrl(file.sessionId, file.path, file.version), {
+          credentials: 'same-origin',
+          headers: { accept: 'application/json' },
+        });
+        const data = await response.json().catch(() => null);
+        if (data && data.ok && Array.isArray(data.lines)) lines = data.lines;
+      } catch (_error) {
+        lines = [];
+      }
+      if (gutterCache.size >= GUTTER_CACHE_LIMIT) gutterCache.clear();
+      gutterCache.set(key, lines);
+      return lines;
+    }
+
+    function ensureGutterStyle() {
+      if (document.getElementById(GUTTER_STYLE_ID)) return;
+      const style = document.createElement('style');
+      style.id = GUTTER_STYLE_ID;
+      style.textContent =
+        `[data-textpreview-url].gb-gutter-on [data-code-preview] pre .line{` +
+        `padding-inline-start:calc(${GUTTER_WIDTH}px + var(--dsl-code-block-line-number-width) + 12px) !important;}` +
+        `[data-textpreview-url].gb-gutter-on [data-code-preview] pre .line::before{` +
+        `inset-inline-start:${GUTTER_WIDTH}px !important;}` +
+        `.gb-gutter{position:absolute;inset-inline-start:0;top:0;bottom:0;width:${GUTTER_WIDTH}px;box-sizing:border-box;` +
+        `display:flex;align-items:center;gap:6px;padding:0 6px;overflow:hidden;white-space:nowrap;` +
+        `font-family:var(--dsw-font-mono,ui-monospace,monospace);font-size:11px;line-height:1.4;` +
+        `color:var(--dsw-alias-label-secondary);border-inline-end:0.5px solid var(--dsw-alias-border-l1);` +
+        `user-select:none;cursor:default;pointer-events:auto;}` +
+        `.gb-gutter .gb-date{flex:none;color:var(--dsw-alias-label-tertiary);}` +
+        `.gb-gutter .gb-author{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;}`;
+      document.head.appendChild(style);
+    }
+
+    function gutterColor(sha) {
+      if (!sha || /^0+$/.test(sha)) return 'rgba(130,130,130,0.10)';
+      let hash = 0;
+      for (let i = 0; i < sha.length; i += 1) hash = (hash * 31 + sha.charCodeAt(i)) >>> 0;
+      return `hsla(${hash % 360}, 62%, 52%, 0.20)`;
+    }
+
+    function formatGutterDate(iso) {
+      if (!iso) return '';
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+      return match ? `${match[3]}/${match[2]}/${match[1]}` : iso;
+    }
+
+    function clearGutterDom(preview) {
+      preview.querySelectorAll('.gb-gutter').forEach((element) => element.remove());
+    }
+
+    function syncGutterDom(preview, lines) {
+      ensureGutterStyle();
+      preview.classList.add('gb-gutter-on');
+      const lineElements = preview.querySelectorAll('[data-code-preview] pre .line');
+      lineElements.forEach((lineElement, index) => {
+        const info = lines[index];
+        let span = lineElement.querySelector(':scope > .gb-gutter');
+        if (!info) {
+          if (span) span.remove();
+          return;
+        }
+        if (!span) {
+          span = document.createElement('span');
+          span.className = 'gb-gutter';
+          span.dataset.line = String(index + 1);
+          lineElement.insertBefore(span, lineElement.firstChild);
+        }
+        const dateText = formatGutterDate(info.date);
+        const authorText = info.uncommitted ? '未提交' : (info.author || '');
+        const signature = `${info.sha || ''}|${dateText}|${authorText}`;
+        if (span.dataset.sig === signature) return;
+        span.dataset.sig = signature;
+        span.style.background = gutterColor(info.sha);
+        span.textContent = '';
+        const dateElement = document.createElement('span');
+        dateElement.className = 'gb-date';
+        dateElement.textContent = dateText;
+        const authorElement = document.createElement('span');
+        authorElement.className = 'gb-author';
+        authorElement.textContent = authorText;
+        span.append(dateElement, authorElement);
+        span.title = info.uncommitted ? '未提交的更改' : `${dateText} ${authorText} ${info.shortSha || ''}`.trim();
+      });
+    }
+
     /** Parse a `dsh-resource://file/...` address into session + path. */
     function parseFileAddress(address) {
       if (typeof address !== 'string' || !address.startsWith(FILE_PREFIX)) return undefined;
@@ -324,6 +432,7 @@ window.__ModuleLoader__.load({
       const [enabled, setEnabledUi] = React.useState(isEnabled());
       const [hover, setHover] = React.useState(false);
       const [support, setSupport] = React.useState('unknown');
+      const [fileInfo, setFileInfo] = React.useState(null);
       const [tipOpen, setTipOpen] = React.useState(false);
       const [tipTop, setTipTop] = React.useState(0);
       const [tipRight, setTipRight] = React.useState(0);
@@ -352,7 +461,11 @@ window.__ModuleLoader__.load({
                 retryTimer = setTimeout(resolve, 1500);
                 return;
               }
-              setSupport(status.tracked && status.text ? 'yes' : 'no');
+              const eligible = status.tracked && status.text;
+              setSupport(eligible ? 'yes' : 'no');
+              setFileInfo(eligible
+                ? { sessionId: parsed.sessionId, path: parsed.path, contentId: address, version: status.version || '' }
+                : null);
             });
         };
         resolve();
@@ -363,6 +476,49 @@ window.__ModuleLoader__.load({
       }, []);
 
       React.useEffect(() => () => clearTimeout(tipTimerRef.current), []);
+
+      // Inject / remove the inline blame gutter column in the current preview.
+      React.useEffect(() => {
+        if (!enabled || support !== 'yes' || !fileInfo) return undefined;
+        const element = buttonRef.current;
+        const preview = element && element.closest ? element.closest('[data-textpreview-url]') : null;
+        if (!preview) return undefined;
+        let cancelled = false;
+        let lines = null;
+        let observer = null;
+        let raf = 0;
+        const retries = [];
+        const schedule = () => {
+          if (raf) return;
+          raf = requestAnimationFrame(() => {
+            raf = 0;
+            if (cancelled || !lines) return;
+            syncGutterDom(preview, lines);
+            if (observer) observer.takeRecords();
+          });
+        };
+        fetchGutterLines(fileInfo).then((data) => {
+          if (cancelled) return;
+          lines = Array.isArray(data) ? data : [];
+          syncGutterDom(preview, lines);
+          observer = new MutationObserver(schedule);
+          observer.observe(preview, { childList: true, subtree: true });
+          observer.takeRecords();
+          for (const delay of [120, 400, 900, 1600]) {
+            retries.push(setTimeout(() => {
+              if (!cancelled && lines) syncGutterDom(preview, lines);
+            }, delay));
+          }
+        });
+        return () => {
+          cancelled = true;
+          if (observer) observer.disconnect();
+          if (raf) cancelAnimationFrame(raf);
+          for (const timer of retries) clearTimeout(timer);
+          preview.classList.remove('gb-gutter-on');
+          clearGutterDom(preview);
+        };
+      }, [enabled, support, fileInfo && fileInfo.contentId, fileInfo && fileInfo.version]);
 
       const openTip = () => {
         clearTimeout(tipTimerRef.current);
@@ -653,13 +809,20 @@ window.__ModuleLoader__.load({
             }
             cancelHide();
 
-            const line = lineAt(target);
-            const file = line === undefined ? undefined : fileAt(target);
-            if (line === undefined || !file) {
-              // Inside the sidebar but not on a blamable line: stop a pending dwell and
-              // keep any already-visible bubble where it is.
+            const gutter = target.closest('.gb-gutter');
+            if (!gutter) {
+              // The bubble is only shown while hovering the blame gutter column.
               showSeqRef.current += 1;
               clearDwell();
+              scheduleHide();
+              return;
+            }
+            const line = Number(gutter.dataset.line);
+            const file = fileAt(target);
+            if (!Number.isInteger(line) || line < 1 || !file) {
+              showSeqRef.current += 1;
+              clearDwell();
+              scheduleHide();
               return;
             }
 

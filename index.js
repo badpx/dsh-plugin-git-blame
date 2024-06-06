@@ -71,7 +71,7 @@ function resolveFile(ctx, session, requestedPath) {
  * Run one managed git command and collect its output.
  * @returns {Promise<{ ok: boolean, exitCode?: number | null, stdout: string, stderr: string, message?: string }>}
  */
-async function runGit(ctx, cwd, argv) {
+async function runGit(ctx, cwd, argv, maxStdoutBytes = 1024 * 1024) {
   let handle;
   try {
     handle = ctx.subprocess.spawn({
@@ -79,7 +79,7 @@ async function runGit(ctx, cwd, argv) {
       cwd,
       stdio: {
         stdin: 'ignore',
-        stdout: { maxBytes: 1024 * 1024 },
+        stdout: { maxBytes: maxStdoutBytes },
         stderr: { maxBytes: 64 * 1024 },
       },
       graceMs: GIT_TIMEOUT_MS,
@@ -207,6 +207,80 @@ function parsePorcelain(text) {
 }
 
 /**
+ * Parse full `git blame --line-porcelain` output into one entry per source line.
+ * @returns {Array<Record<string, unknown> | null>}
+ */
+function parseFullPorcelain(text) {
+  const out = [];
+  let current;
+  for (const raw of text.split('\n')) {
+    if (raw.startsWith('\t')) {
+      if (current !== undefined) {
+        out[current.finalLine - 1] = current.record;
+        current = undefined;
+      }
+      continue;
+    }
+    const headerMatch = /^\^?([0-9a-f]{40})\s+\d+\s+(\d+)(?:\s+\d+)?\s*$/.exec(raw);
+    if (headerMatch) {
+      const sha = headerMatch[1];
+      current = {
+        finalLine: Number(headerMatch[2]),
+        record: {
+          sha,
+          shortSha: sha.slice(0, 8),
+          author: '',
+          date: '',
+          uncommitted: /^0+$/.test(sha),
+        },
+      };
+      continue;
+    }
+    if (current !== undefined && raw !== '') {
+      const space = raw.indexOf(' ');
+      if (space < 0) continue;
+      const key = raw.slice(0, space);
+      const value = raw.slice(space + 1);
+      if (key === 'author') current.record.author = value;
+      else if (key === 'author-time') {
+        const time = Number(value);
+        if (time > 0) {
+          const d = new Date(time * 1000);
+          if (!Number.isNaN(d.getTime())) current.record.date = d.toISOString().slice(0, 10);
+        }
+      }
+    }
+  }
+  const result = [];
+  for (let i = 0; i < out.length; i += 1) result.push(out[i] === undefined ? null : out[i]);
+  return result;
+}
+
+/**
+ * Blame the whole file, returning a per-line array of commit summaries.
+ * @returns {Promise<Record<string, unknown>>}
+ */
+async function blameFile(ctx, cwd, absolutePath) {
+  const result = await runGit(ctx, cwd, ['git', '-C', cwd, 'blame', '--line-porcelain', '--', absolutePath], 32 * 1024 * 1024);
+  if (result.exitCode === undefined) {
+    return { ok: false, code: 'spawn-failed', message: result.message };
+  }
+  if (!result.ok) {
+    const message = result.stderr.trim() || result.stdout.trim() || 'git blame failed';
+    if (/not a git repository/i.test(message)) {
+      return { ok: false, code: 'not-repo', message: 'This file is not inside a Git repository' };
+    }
+    if (/no such path|does not exist in/i.test(message)) {
+      return { ok: false, code: 'not-tracked', message: 'File is not tracked by Git' };
+    }
+    return { ok: false, code: 'git-failed', message: message.split('\n')[0] };
+  }
+  const lines = parseFullPorcelain(result.stdout);
+  if (lines.length > 50000) return { ok: false, code: 'too-large', message: 'File is too large for inline blame' };
+  return { ok: true, lines };
+}
+
+/**
  * Run git blame for one line, then attach the commit message title/body.
  * @returns {Promise<Record<string, unknown>>}
  */
@@ -259,6 +333,7 @@ async function handleRequest(ctx, req, res) {
     const sessionId = url.searchParams.get('sessionId');
     const filePath = url.searchParams.get('path');
     const isStatusRequest = url.pathname.replace(/\/+$/, '') === '/plugin/git-blame/status';
+    const isFileRequest = url.pathname.replace(/\/+$/, '') === '/plugin/git-blame/file';
 
     if (!sessionId || !filePath) {
       sendJson(res, 400, { ok: false, message: 'Missing sessionId/path' });
@@ -286,6 +361,12 @@ async function handleRequest(ctx, req, res) {
       const text = isTextPath(absolutePath);
       const version = tracked ? await fileVersion(ctx, cwd, absolutePath) : '';
       sendJson(res, 200, { ok: true, tracked, text, version });
+      return;
+    }
+
+    if (isFileRequest) {
+      const fileResult = await blameFile(ctx, cwd, absolutePath);
+      sendJson(res, 200, fileResult);
       return;
     }
 
