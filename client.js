@@ -98,12 +98,16 @@ window.__ModuleLoader__.load({
       return url.href;
     }
 
-    /** Fixed-width, tabular line number so the rest of the row never shifts. */
+    /**
+     * Fixed-width, tabular line number whose spare space sits AFTER the digits
+     * (left aligned) so `#line` starts flush with the title below and the
+     * following short SHA never shifts as the digit count changes.
+     */
     const lineBadgeStyle = {
       flex: 'none',
       minWidth: '5ch',
       display: 'inline-block',
-      textAlign: 'right',
+      textAlign: 'left',
       fontFamily: 'var(--dsw-font-mono, ui-monospace, monospace)',
       fontSize: '11px',
       fontVariantNumeric: 'tabular-nums',
