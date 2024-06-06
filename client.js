@@ -22,10 +22,84 @@ window.__ModuleLoader__.load({
     const CACHE_TTL_MS = 600000;
     /** Maximum number of line entries kept in the client blame cache. */
     const CACHE_LIMIT = 2000;
-    /** How long a probed file version is reused before re-probing. */
-    const VERSION_TTL_MS = 1000;
     /** Idle delay before the bubble fades to its dimmed opacity. */
     const IDLE_DIM_MS = 9000;
+
+    /** Persisted on/off switch shared by the toolbar toggle and the overlay. */
+    const ENABLED_STORAGE_KEY = 'dsh.git-blame-hover.enabled';
+    const enabledListeners = new Set();
+    let enabledValue = (() => {
+      try {
+        const stored = window.localStorage.getItem(ENABLED_STORAGE_KEY);
+        return stored === null ? true : stored === '1';
+      } catch (_error) {
+        return true;
+      }
+    })();
+
+    function isEnabled() {
+      return enabledValue;
+    }
+
+    function setEnabled(next) {
+      const value = !!next;
+      if (value === enabledValue) return;
+      enabledValue = value;
+      try {
+        window.localStorage.setItem(ENABLED_STORAGE_KEY, value ? '1' : '0');
+      } catch (_error) {
+        /* storage may be unavailable */
+      }
+      for (const listener of enabledListeners) {
+        try {
+          listener();
+        } catch (_error) {
+          /* ignore a failing subscriber */
+        }
+      }
+    }
+
+    function subscribeEnabled(listener) {
+      enabledListeners.add(listener);
+      return () => enabledListeners.delete(listener);
+    }
+
+    /** Short-lived per-file status cache: git-tracked? text? content version? */
+    const STATUS_TTL_MS = 1000;
+    const statusCache = new Map();
+    const statusInflight = new Map();
+
+    async function fetchFileStatus(file) {
+      const cached = statusCache.get(file.contentId);
+      if (cached !== undefined && Date.now() - cached.ts <= STATUS_TTL_MS) return cached.value;
+      const inflight = statusInflight.get(file.contentId);
+      if (inflight !== undefined) return inflight;
+      const request = (async () => {
+        let value = { tracked: false, text: false, version: '', determined: false };
+        try {
+          const response = await fetch(buildStatusUrl(file.sessionId, file.path), {
+            credentials: 'same-origin',
+            headers: { accept: 'application/json' },
+          });
+          const data = await response.json().catch(() => null);
+          if (data && data.ok) {
+            value = {
+              tracked: !!data.tracked,
+              text: !!data.text,
+              version: typeof data.version === 'string' ? data.version : '',
+              determined: true,
+            };
+          }
+        } catch (_error) {
+          /* leave determined=false so callers can retry */
+        }
+        statusCache.set(file.contentId, { value, ts: Date.now() });
+        statusInflight.delete(file.contentId);
+        return value;
+      })();
+      statusInflight.set(file.contentId, request);
+      return request;
+    }
 
     /** Parse a `dsh-resource://file/...` address into session + path. */
     function parseFileAddress(address) {
@@ -107,8 +181,8 @@ window.__ModuleLoader__.load({
       return url.href;
     }
 
-    function buildVersionUrl(sessionId, filePath) {
-      const url = new URL('plugin/git-blame/version', document.baseURI);
+    function buildStatusUrl(sessionId, filePath) {
+      const url = new URL('plugin/git-blame/status', document.baseURI);
       url.searchParams.set('sessionId', sessionId);
       url.searchParams.set('path', filePath);
       return url.href;
@@ -220,13 +294,101 @@ window.__ModuleLoader__.load({
         message);
     }
 
+    /** Toolbar switch in the preview header that turns the blame bubble on/off. */
+    function BlameToggle() {
+      const [enabled, setEnabledUi] = React.useState(isEnabled());
+      const [hover, setHover] = React.useState(false);
+      const [support, setSupport] = React.useState('unknown');
+      const buttonRef = React.useRef(null);
+      React.useEffect(() => subscribeEnabled(() => setEnabledUi(isEnabled())), []);
+      React.useEffect(() => {
+        let active = true;
+        let retryTimer = 0;
+        const resolve = () => {
+          const element = buttonRef.current;
+          const preview = element && element.closest ? element.closest('[data-textpreview-url]') : null;
+          const address = preview && preview.dataset ? preview.dataset.textpreviewUrl : undefined;
+          const parsed = address ? parseFileAddress(address) : undefined;
+          if (!parsed || parsed.scope !== 'session') {
+            if (active) setSupport('no');
+            return;
+          }
+          fetchFileStatus({ sessionId: parsed.sessionId, path: parsed.path, contentId: address })
+            .then((status) => {
+              if (!active) return;
+              if (!status.determined) {
+                // Transient failure (e.g. Host not ready): retry soon.
+                retryTimer = setTimeout(resolve, 1500);
+                return;
+              }
+              setSupport(status.tracked && status.text ? 'yes' : 'no');
+            });
+        };
+        resolve();
+        return () => {
+          active = false;
+          clearTimeout(retryTimer);
+        };
+      }, []);
+
+      if (support === 'no') return null;
+
+      const title = enabled ? 'Git Blame 气泡：开（点击关闭）' : 'Git Blame 气泡：关（点击开启）';
+      const icon = h('svg', {
+        viewBox: '0 0 16 16',
+        width: 15,
+        height: 15,
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 1.4,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        'aria-hidden': true,
+      },
+      h('rect', { x: 2, y: 3, width: 12, height: 8, rx: 2 }),
+      h('path', { d: 'M5 11 L5 13.6 L7.8 11' }),
+      h('line', { x1: 4.6, y1: 6, x2: 11.4, y2: 6 }),
+      h('line', { x1: 4.6, y1: 8.4, x2: 9.2, y2: 8.4 }),
+      enabled ? null : h('line', { x1: 2.4, y1: 13.4, x2: 13.6, y2: 2.6 }));
+
+      return h('button', {
+        ref: buttonRef,
+        type: 'button',
+        title,
+        'aria-label': title,
+        'aria-pressed': enabled,
+        'data-git-blame-toggle': enabled ? 'on' : 'off',
+        onClick: () => setEnabled(!isEnabled()),
+        onMouseEnter: () => setHover(true),
+        onMouseLeave: () => setHover(false),
+        style: {
+          width: '28px',
+          height: '28px',
+          flex: 'none',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '6px',
+          margin: '0',
+          visibility: support === 'yes' ? 'visible' : 'hidden',
+          color: enabled ? 'var(--dsw-alias-label-secondary)' : 'var(--dsw-alias-label-tertiary)',
+          background: hover ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+          border: 'none',
+          borderRadius: 'var(--dsw-radius-sm)',
+          cursor: 'pointer',
+          opacity: enabled ? 1 : 0.72,
+        },
+      }, icon);
+    }
+
     function apply(ctx) {
       function Overlay() {
         const [tip, setTip] = React.useState(null);
         const [dimmed, setDimmed] = React.useState(false);
+        const [enabled, setEnabledUi] = React.useState(isEnabled());
         const tipRef = React.useRef(null);
+        const hideRef = React.useRef(null);
         const cacheRef = React.useRef(new Map());
-        const versionRef = React.useRef(new Map());
         const timerRef = React.useRef(0);
         const seqRef = React.useRef(0);
         const showSeqRef = React.useRef(0);
@@ -281,6 +443,7 @@ window.__ModuleLoader__.load({
               publish(null);
             }
           };
+          hideRef.current = hide;
 
           const scheduleHide = () => {
             clearTimeout(hideTimer);
@@ -317,24 +480,6 @@ window.__ModuleLoader__.load({
             cacheRef.current.set(key, { data, ts: Date.now() });
           };
 
-          const fetchVersion = async (file) => {
-            const known = versionRef.current.get(file.contentId);
-            if (known !== undefined && Date.now() - known.ts <= VERSION_TTL_MS) return known.version;
-            let version = '';
-            try {
-              const response = await fetch(buildVersionUrl(file.sessionId, file.path), {
-                credentials: 'same-origin',
-                headers: { accept: 'application/json' },
-              });
-              const data = await response.json().catch(() => ({ ok: false }));
-              if (data && data.ok && typeof data.version === 'string') version = data.version;
-            } catch (_error) {
-              version = '';
-            }
-            versionRef.current.set(file.contentId, { version, ts: Date.now() });
-            return version;
-          };
-
           const fetchBlame = (key, file, line, version) => {
             const seq = ++seqRef.current;
             fetch(buildUrl(file.sessionId, file.path, line, version), {
@@ -362,9 +507,15 @@ window.__ModuleLoader__.load({
 
           const showLine = async (base, file, line, x, y) => {
             const my = ++showSeqRef.current;
-            const version = await fetchVersion(file);
+            const status = await fetchFileStatus(file);
             // Superseded by a newer line or by hiding.
             if (my !== showSeqRef.current) return;
+            // Only git-tracked text files get a bubble.
+            if (!status.tracked || !status.text) {
+              if (tipRef.current !== null) hide();
+              return;
+            }
+            const version = status.version;
             const key = `${base}@${version}`;
             const cached = cacheGet(key);
             if (cached !== undefined) {
@@ -379,6 +530,10 @@ window.__ModuleLoader__.load({
           };
 
           const process = (x, y, target) => {
+            if (!isEnabled()) {
+              if (tipRef.current !== null) hide();
+              return;
+            }
             if (!(target instanceof Element)) {
               showSeqRef.current += 1;
               clearDwell();
@@ -470,9 +625,17 @@ window.__ModuleLoader__.load({
             clearIdle();
             clearDwell();
             clearTimeout(timerRef.current);
+            hideRef.current = null;
           };
         }, []);
 
+        React.useEffect(() => subscribeEnabled(() => {
+          const value = isEnabled();
+          setEnabledUi(value);
+          if (!value && hideRef.current) hideRef.current();
+        }), []);
+
+        if (!enabled) return null;
         if (tip === null) return null;
 
         const viewportWidth = window.innerWidth || 1280;
@@ -507,6 +670,13 @@ window.__ModuleLoader__.load({
       ctx.effect(() =>
         ctx.slots.inject('shell.overlay', () =>
           ctx.slots.register({ name: 'shell.overlay', id: 'git-blame-hover' }, Overlay)));
+
+      ctx.effect(() =>
+        ctx.slots.inject('sidebar.right.tab.document.actions', () =>
+          ctx.slots.register(
+            { name: 'sidebar.right.tab.document.actions', id: 'git-blame-toggle', order: 40 },
+            BlameToggle,
+          )));
     }
 
     return {

@@ -16,6 +16,10 @@ sidebar's file preview, hovering a line shows a small card with that line's
   maps the hovered tab to its `dsh-resource://file/...` address, and asks the
   Host route for the blame of that line.
 
+A toggle button in the preview header turns the hover bubble on or off and
+remembers the choice. Both the toggle and the bubble only appear for files that
+are **text and tracked by Git**; untracked or binary files show neither.
+
 ## Notes
 
 - The preview is read-only, so the interaction uses the mouse pointer rather

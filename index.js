@@ -22,6 +22,22 @@ const GIT_TIMEOUT_MS = 8000;
 const MESSAGE_CACHE_LIMIT = 500;
 const messageCache = new Map();
 
+/** File suffixes treated as non-text (binary, media, office, images). */
+const NON_TEXT_EXTENSIONS = new Set([
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'svg', 'tif', 'tiff', 'avif',
+  'pdf', 'zip', 'gz', 'tgz', 'bz2', 'xz', 'tar', '7z', 'rar',
+  'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'odt', 'ods', 'odp',
+  'exe', 'dll', 'so', 'dylib', 'bin', 'class', 'jar', 'wasm', 'o', 'a',
+  'woff', 'woff2', 'ttf', 'otf', 'eot',
+  'mp3', 'wav', 'ogg', 'flac', 'mp4', 'mov', 'avi', 'mkv', 'webm',
+]);
+
+/** Extension-based text check; unknown extensions count as text (the preview does the same). */
+function isTextPath(filePath) {
+  const ext = path.extname(filePath).slice(1).toLowerCase();
+  return !NON_TEXT_EXTENSIONS.has(ext);
+}
+
 /**
  * @param {import('node:http').IncomingMessage} req
  * @param {import('node:http').ServerResponse} res
@@ -242,7 +258,7 @@ async function handleRequest(ctx, req, res) {
     const url = new URL(req.url || '/', 'http://localhost');
     const sessionId = url.searchParams.get('sessionId');
     const filePath = url.searchParams.get('path');
-    const isVersionRequest = url.pathname.replace(/\/+$/, '') === '/plugin/git-blame/version';
+    const isStatusRequest = url.pathname.replace(/\/+$/, '') === '/plugin/git-blame/status';
 
     if (!sessionId || !filePath) {
       sendJson(res, 400, { ok: false, message: 'Missing sessionId/path' });
@@ -263,9 +279,13 @@ async function handleRequest(ctx, req, res) {
 
     const cwd = ctx.workingDirectory.get(session);
 
-    if (isVersionRequest) {
-      const version = await fileVersion(ctx, cwd, absolutePath);
-      sendJson(res, 200, { ok: true, version });
+    if (isStatusRequest) {
+      const relative = path.relative(cwd, absolutePath) || path.basename(absolutePath);
+      const trackedResult = await runGit(ctx, cwd, ['git', '-C', cwd, 'ls-files', '--error-unmatch', '--', relative]);
+      const tracked = trackedResult.ok;
+      const text = isTextPath(absolutePath);
+      const version = tracked ? await fileVersion(ctx, cwd, absolutePath) : '';
+      sendJson(res, 200, { ok: true, tracked, text, version });
       return;
     }
 
