@@ -110,6 +110,16 @@ window.__ModuleLoader__.load({
       color: 'var(--dsw-alias-label-tertiary)',
     };
 
+    /** Maximum commit-message body lines shown in the bubble. */
+    const MAX_BODY_LINES = 5;
+
+    /** Cap a message body at MAX_BODY_LINES logical lines, appending an ellipsis when cut. */
+    function clampMessageBody(text) {
+      const lines = String(text || '').split('\n');
+      if (lines.length <= MAX_BODY_LINES) return String(text || '');
+      return lines.slice(0, MAX_BODY_LINES).join('\n') + '…';
+    }
+
     /** Top section: #line, short SHA, date, author. */
     function renderTopLine(tip, data) {
       return h('div', {
@@ -176,11 +186,12 @@ window.__ModuleLoader__.load({
               color: 'var(--dsw-alias-label-secondary)',
               whiteSpace: 'pre-wrap',
               overflow: 'hidden',
+              textOverflow: 'ellipsis',
               display: '-webkit-box',
-              WebkitLineClamp: 5,
+              WebkitLineClamp: MAX_BODY_LINES,
               WebkitBoxOrient: 'vertical',
             },
-          }, messageBody)
+          }, clampMessageBody(messageBody))
           : null)
         : null;
 

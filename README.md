@@ -25,6 +25,8 @@ sidebar's file preview, hovering a line shows a small card with that line's
   lines), and disappears ~0.5 s after the pointer leaves that column.
 - The card is slightly translucent (opacity 0.94) so the code underneath stays
   readable.
+- The commit message is shown as a bold first-line title plus a normal body; the
+  body is capped at 5 lines and ends with an ellipsis when truncated.
 - Results are cached per file+line for the lifetime of the page.
 - Files outside a Git repository, or lines that are not tracked, show a short
   explanatory message instead of a commit.
