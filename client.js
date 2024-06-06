@@ -796,33 +796,21 @@ window.__ModuleLoader__.load({
             }
             if (!(target instanceof Element)) {
               showSeqRef.current += 1;
-              clearDwell();
-              scheduleHide();
+              hide();
               return;
             }
-            // Leaving the right-sidebar column hides the bubble after LEAVE_DELAY_MS.
-            if (!target.closest('[data-sidebar-right-session]')) {
-              showSeqRef.current += 1;
-              clearDwell();
-              scheduleHide();
-              return;
-            }
-            cancelHide();
-
             const gutter = target.closest('.gb-gutter');
             if (!gutter) {
-              // The bubble is only shown while hovering the blame gutter column.
+              // Bubble only shows while hovering the blame gutter; leaving closes it immediately.
               showSeqRef.current += 1;
-              clearDwell();
-              scheduleHide();
+              hide();
               return;
             }
             const line = Number(gutter.dataset.line);
             const file = fileAt(target);
             if (!Number.isInteger(line) || line < 1 || !file) {
               showSeqRef.current += 1;
-              clearDwell();
-              scheduleHide();
+              hide();
               return;
             }
 
@@ -832,34 +820,8 @@ window.__ModuleLoader__.load({
               if (current.x !== x || current.y !== y) publish({ ...current, x, y });
               return;
             }
-
-            if (current) {
-              // Already visible: follow the pointer onto the next line immediately.
-              clearDwell();
-              showLine(base, file, line, x, y);
-              return;
-            }
-
-            // Not visible yet: require a DWELL_DELAY_MS rest on this line before showing.
-            if (dwellKey !== base) {
-              clearDwell();
-              dwellKey = base;
-            }
-            dwellFile = file;
-            dwellLine = line;
-            dwellX = x;
-            dwellY = y;
-            if (dwellTimer === 0) {
-              dwellTimer = setTimeout(() => {
-                dwellTimer = 0;
-                const pendingBase = dwellKey;
-                if (pendingBase === '' || !dwellFile) return;
-                const shown = tipRef.current;
-                if (shown && shown.base === pendingBase) return;
-                showLine(pendingBase, dwellFile, dwellLine, dwellX, dwellY);
-                dwellKey = '';
-              }, DWELL_DELAY_MS);
-            }
+            // Show immediately — no dwell delay when entering the gutter.
+            showLine(base, file, line, x, y);
           };
 
           let lastMoveAt = 0;
