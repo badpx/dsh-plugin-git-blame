@@ -18,6 +18,12 @@ window.__ModuleLoader__.load({
     const DWELL_DELAY_MS = 500;
     const LEAVE_DELAY_MS = 500;
     const CARD_WIDTH = 360;
+    /** Blame cache: entries older than this are treated as misses. */
+    const CACHE_TTL_MS = 600000;
+    /** Maximum number of line entries kept in the client blame cache. */
+    const CACHE_LIMIT = 2000;
+    /** How long a probed file version is reused before re-probing. */
+    const VERSION_TTL_MS = 1000;
 
     /** Parse a `dsh-resource://file/...` address into session + path. */
     function parseFileAddress(address) {
@@ -90,11 +96,19 @@ window.__ModuleLoader__.load({
       return { sessionId: parsed.sessionId, path: parsed.path, contentId };
     }
 
-    function buildUrl(sessionId, filePath, line) {
+    function buildUrl(sessionId, filePath, line, version) {
       const url = new URL('plugin/git-blame', document.baseURI);
       url.searchParams.set('sessionId', sessionId);
       url.searchParams.set('path', filePath);
       url.searchParams.set('line', String(line));
+      if (version) url.searchParams.set('version', version);
+      return url.href;
+    }
+
+    function buildVersionUrl(sessionId, filePath) {
+      const url = new URL('plugin/git-blame/version', document.baseURI);
+      url.searchParams.set('sessionId', sessionId);
+      url.searchParams.set('path', filePath);
       return url.href;
     }
 
@@ -209,8 +223,10 @@ window.__ModuleLoader__.load({
         const [tip, setTip] = React.useState(null);
         const tipRef = React.useRef(null);
         const cacheRef = React.useRef(new Map());
+        const versionRef = React.useRef(new Map());
         const timerRef = React.useRef(0);
         const seqRef = React.useRef(0);
+        const showSeqRef = React.useRef(0);
         const lastKeyRef = React.useRef('');
 
         React.useEffect(() => {
@@ -238,6 +254,7 @@ window.__ModuleLoader__.load({
             hideTimer = 0;
             clearDwell();
             clearTimeout(timerRef.current);
+            showSeqRef.current += 1;
             if (tipRef.current !== null) {
               lastKeyRef.current = '';
               publish(null);
@@ -256,9 +273,50 @@ window.__ModuleLoader__.load({
             }
           };
 
-          const fetchBlame = (key, file, line) => {
+          const cacheGet = (key) => {
+            const entry = cacheRef.current.get(key);
+            if (entry === undefined) return undefined;
+            if (Date.now() - entry.ts > CACHE_TTL_MS) {
+              cacheRef.current.delete(key);
+              return undefined;
+            }
+            // Refresh recency for LRU ordering.
+            cacheRef.current.delete(key);
+            cacheRef.current.set(key, entry);
+            return entry.data;
+          };
+
+          const cacheSet = (key, data) => {
+            if (cacheRef.current.has(key)) {
+              cacheRef.current.delete(key);
+            } else if (cacheRef.current.size >= CACHE_LIMIT) {
+              const oldest = cacheRef.current.keys().next();
+              if (!oldest.done) cacheRef.current.delete(oldest.value);
+            }
+            cacheRef.current.set(key, { data, ts: Date.now() });
+          };
+
+          const fetchVersion = async (file) => {
+            const known = versionRef.current.get(file.contentId);
+            if (known !== undefined && Date.now() - known.ts <= VERSION_TTL_MS) return known.version;
+            let version = '';
+            try {
+              const response = await fetch(buildVersionUrl(file.sessionId, file.path), {
+                credentials: 'same-origin',
+                headers: { accept: 'application/json' },
+              });
+              const data = await response.json().catch(() => ({ ok: false }));
+              if (data && data.ok && typeof data.version === 'string') version = data.version;
+            } catch (_error) {
+              version = '';
+            }
+            versionRef.current.set(file.contentId, { version, ts: Date.now() });
+            return version;
+          };
+
+          const fetchBlame = (key, file, line, version) => {
             const seq = ++seqRef.current;
-            fetch(buildUrl(file.sessionId, file.path, line), {
+            fetch(buildUrl(file.sessionId, file.path, line, version), {
               credentials: 'same-origin',
               headers: { accept: 'application/json' },
             })
@@ -266,7 +324,7 @@ window.__ModuleLoader__.load({
               .then((data) => {
                 if (seq !== seqRef.current) return;
                 if (!tipRef.current || tipRef.current.key !== key) return;
-                if (data && data.ok) cacheRef.current.set(key, data);
+                if (data && data.ok) cacheSet(key, data);
                 publish({
                   ...tipRef.current,
                   status: data && data.ok ? 'ok' : 'error',
@@ -281,27 +339,34 @@ window.__ModuleLoader__.load({
               });
           };
 
-          const showLine = (key, file, line, x, y) => {
-            const cached = cacheRef.current.get(key);
-            if (cached) {
-              publish({ key, x, y, line, status: 'ok', data: cached });
+          const showLine = async (base, file, line, x, y) => {
+            const my = ++showSeqRef.current;
+            const version = await fetchVersion(file);
+            // Superseded by a newer line or by hiding.
+            if (my !== showSeqRef.current) return;
+            const key = `${base}@${version}`;
+            const cached = cacheGet(key);
+            if (cached !== undefined) {
+              publish({ key, base, x, y, line, status: 'ok', data: cached });
               return;
             }
-            publish({ key, x, y, line, status: 'loading' });
+            publish({ key, base, x, y, line, status: 'loading' });
             clearTimeout(timerRef.current);
             timerRef.current = setTimeout(() => {
-              if (tipRef.current && tipRef.current.key === key) fetchBlame(key, file, line);
+              if (tipRef.current && tipRef.current.key === key) fetchBlame(key, file, line, version);
             }, FETCH_DELAY_MS);
           };
 
           const process = (x, y, target) => {
             if (!(target instanceof Element)) {
+              showSeqRef.current += 1;
               clearDwell();
               scheduleHide();
               return;
             }
             // Leaving the right-sidebar column hides the bubble after LEAVE_DELAY_MS.
             if (!target.closest('[data-sidebar-right-session]')) {
+              showSeqRef.current += 1;
               clearDwell();
               scheduleHide();
               return;
@@ -313,13 +378,14 @@ window.__ModuleLoader__.load({
             if (line === undefined || !file) {
               // Inside the sidebar but not on a blamable line: stop a pending dwell and
               // keep any already-visible bubble where it is.
+              showSeqRef.current += 1;
               clearDwell();
               return;
             }
 
-            const key = `${file.contentId}#${line}`;
+            const base = `${file.contentId}#${line}`;
             const current = tipRef.current;
-            if (current && current.key === key) {
+            if (current && current.base === base) {
               if (current.x !== x || current.y !== y) publish({ ...current, x, y });
               return;
             }
@@ -327,14 +393,14 @@ window.__ModuleLoader__.load({
             if (current) {
               // Already visible: follow the pointer onto the next line immediately.
               clearDwell();
-              showLine(key, file, line, x, y);
+              showLine(base, file, line, x, y);
               return;
             }
 
             // Not visible yet: require a DWELL_DELAY_MS rest on this line before showing.
-            if (dwellKey !== key) {
+            if (dwellKey !== base) {
               clearDwell();
-              dwellKey = key;
+              dwellKey = base;
             }
             dwellFile = file;
             dwellLine = line;
@@ -343,11 +409,11 @@ window.__ModuleLoader__.load({
             if (dwellTimer === 0) {
               dwellTimer = setTimeout(() => {
                 dwellTimer = 0;
-                const pendingKey = dwellKey;
-                if (pendingKey === '' || !dwellFile) return;
+                const pendingBase = dwellKey;
+                if (pendingBase === '' || !dwellFile) return;
                 const shown = tipRef.current;
-                if (shown && shown.key === pendingKey) return;
-                showLine(pendingKey, dwellFile, dwellLine, dwellX, dwellY);
+                if (shown && shown.base === pendingBase) return;
+                showLine(pendingBase, dwellFile, dwellLine, dwellX, dwellY);
                 dwellKey = '';
               }, DWELL_DELAY_MS);
             }

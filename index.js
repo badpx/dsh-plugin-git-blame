@@ -88,17 +88,50 @@ async function runGit(ctx, cwd, argv) {
 }
 
 /**
- * Read one commit's full message (`%B`), cached by SHA.
+ * Touch-on-read LRU get for the commit-message cache.
+ * @returns {string | undefined}
+ */
+function messageGet(sha) {
+  if (!messageCache.has(sha)) return undefined;
+  const value = messageCache.get(sha);
+  messageCache.delete(sha);
+  messageCache.set(sha, value);
+  return value;
+}
+
+/** Insert into the commit-message cache, evicting the least-recently-used entry. */
+function messageSet(sha, message) {
+  if (messageCache.has(sha)) {
+    messageCache.delete(sha);
+  } else if (messageCache.size >= MESSAGE_CACHE_LIMIT) {
+    const oldest = messageCache.keys().next();
+    if (!oldest.done) messageCache.delete(oldest.value);
+  }
+  messageCache.set(sha, message);
+}
+
+/**
+ * Read one commit's full message (`%B`), cached by SHA. Failures are not cached.
  * @returns {Promise<string>}
  */
 async function commitMessage(ctx, cwd, sha) {
-  const cached = messageCache.get(sha);
+  const cached = messageGet(sha);
   if (cached !== undefined) return cached;
   const result = await runGit(ctx, cwd, ['git', '-C', cwd, 'show', '-s', '--format=%B', sha]);
-  const message = result.ok ? result.stdout.replace(/\s+$/, '') : '';
-  if (messageCache.size >= MESSAGE_CACHE_LIMIT) messageCache.clear();
-  messageCache.set(sha, message);
+  if (!result.ok) return '';
+  const message = result.stdout.replace(/\s+$/, '');
+  messageSet(sha, message);
   return message;
+}
+
+/**
+ * Content version of a working-tree file: its Git blob hash. Changes whenever
+ * the file's bytes change (committed or not), so it invalidates stale blame.
+ * @returns {Promise<string>}
+ */
+async function fileVersion(ctx, cwd, absolutePath) {
+  const result = await runGit(ctx, cwd, ['git', '-C', cwd, 'hash-object', '--', absolutePath]);
+  return result.ok ? result.stdout.trim() : '';
 }
 
 /**
@@ -209,10 +242,10 @@ async function handleRequest(ctx, req, res) {
     const url = new URL(req.url || '/', 'http://localhost');
     const sessionId = url.searchParams.get('sessionId');
     const filePath = url.searchParams.get('path');
-    const line = Number(url.searchParams.get('line'));
+    const isVersionRequest = url.pathname.replace(/\/+$/, '') === '/plugin/git-blame/version';
 
-    if (!sessionId || !filePath || !Number.isInteger(line) || line < 1) {
-      sendJson(res, 400, { ok: false, message: 'Missing or invalid sessionId/path/line' });
+    if (!sessionId || !filePath) {
+      sendJson(res, 400, { ok: false, message: 'Missing sessionId/path' });
       return;
     }
 
@@ -228,7 +261,25 @@ async function handleRequest(ctx, req, res) {
       return;
     }
 
-    const result = await blameLine(ctx, ctx.workingDirectory.get(session), absolutePath, line);
+    const cwd = ctx.workingDirectory.get(session);
+
+    if (isVersionRequest) {
+      const version = await fileVersion(ctx, cwd, absolutePath);
+      sendJson(res, 200, { ok: true, version });
+      return;
+    }
+
+    const line = Number(url.searchParams.get('line'));
+    if (!Number.isInteger(line) || line < 1) {
+      sendJson(res, 400, { ok: false, message: 'Missing or invalid line' });
+      return;
+    }
+
+    const providedVersion = url.searchParams.get('version') || '';
+    const result = await blameLine(ctx, cwd, absolutePath, line);
+    if (result.ok) {
+      result.version = providedVersion || await fileVersion(ctx, cwd, absolutePath);
+    }
     sendJson(res, 200, result);
   } catch (error) {
     sendJson(res, 500, { ok: false, message: String((error && error.message) || error) });

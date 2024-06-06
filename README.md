@@ -28,5 +28,14 @@ sidebar's file preview, hovering a line shows a small card with that line's
 - The commit message is shown as a bold first-line title plus a normal body; the
   body is capped at 5 lines and ends with an ellipsis when truncated.
 - Results are cached per file+line for the lifetime of the page.
+
+## Caching
+
+- **Client blame cache**: a bounded LRU (2000 entries, 600 s TTL) keyed by
+  `file address + content version + line`. Each entry is re-validated by a cheap
+  file-version probe (Git blob hash, itself reused for ~1 s), so editing or
+  committing a file invalidates its lines instead of serving stale blame.
+- **Host commit-message cache**: keyed by full commit SHA with a 500-entry LRU.
+  Failures are never cached, so a transient `git show` error is retried.
 - Files outside a Git repository, or lines that are not tracked, show a short
   explanatory message instead of a commit.
