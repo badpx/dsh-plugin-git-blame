@@ -491,7 +491,7 @@ window.__ModuleLoader__.load({
             padding: '6px 10px',
             pointerEvents: 'none',
             zIndex: 2147483000,
-            opacity: dimmed ? 0.2 : 0.8,
+            opacity: dimmed ? 0.15 : 0.85,
             transition: dimmed ? 'opacity 1s ease' : 'opacity 0.15s ease',
             background: 'var(--dsw-alias-bg-layer-2)',
             color: 'var(--dsw-alias-label-primary)',
