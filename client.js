@@ -64,6 +64,31 @@ window.__ModuleLoader__.load({
       return () => enabledListeners.delete(listener);
     }
 
+    /** Shortcut command id and the effective binding shown in the tooltip. */
+    const SHORTCUT_COMMAND_ID = 'git-blame.toggle';
+    let shortcutHint = { keys: [], aria: undefined };
+    const shortcutHintListeners = new Set();
+
+    function getShortcutHint() {
+      return shortcutHint;
+    }
+
+    function setShortcutHint(next) {
+      shortcutHint = next;
+      for (const listener of shortcutHintListeners) {
+        try {
+          listener();
+        } catch (_error) {
+          /* ignore */
+        }
+      }
+    }
+
+    function subscribeShortcutHint(listener) {
+      shortcutHintListeners.add(listener);
+      return () => shortcutHintListeners.delete(listener);
+    }
+
     /** Short-lived per-file status cache: git-tracked? text? content version? */
     const STATUS_TTL_MS = 1000;
     const statusCache = new Map();
@@ -302,9 +327,11 @@ window.__ModuleLoader__.load({
       const [tipOpen, setTipOpen] = React.useState(false);
       const [tipTop, setTipTop] = React.useState(0);
       const [tipRight, setTipRight] = React.useState(0);
+      const [shortcut, setShortcut] = React.useState(getShortcutHint());
       const buttonRef = React.useRef(null);
       const tipTimerRef = React.useRef(0);
       React.useEffect(() => subscribeEnabled(() => setEnabledUi(isEnabled())), []);
+      React.useEffect(() => subscribeShortcutHint(() => setShortcut(getShortcutHint())), []);
       React.useEffect(() => {
         let active = true;
         let retryTimer = 0;
@@ -410,6 +437,26 @@ window.__ModuleLoader__.load({
         },
       }, icon);
 
+      const tipChildren = [h('span', { key: 'text' }, tipText)];
+      if (shortcut && Array.isArray(shortcut.keys) && shortcut.keys.length > 0) {
+        tipChildren.push(h('span', {
+          key: 'keys',
+          style: { display: 'inline-flex', alignItems: 'center', gap: '3px', marginLeft: '8px' },
+        }, ...shortcut.keys.map((key, index) => h('kbd', {
+          key: index,
+          style: {
+            fontFamily: 'var(--dsw-font-mono, ui-monospace, monospace)',
+            fontSize: '11px',
+            lineHeight: 1.3,
+            padding: '0 4px',
+            borderRadius: '3px',
+            color: 'var(--dsw-alias-label-secondary)',
+            background: 'var(--dsw-alias-bg-layer-3)',
+            border: '0.5px solid var(--dsw-alias-border-l2)',
+          },
+        }, key))));
+      }
+
       const tooltip = tipOpen
         ? h('div', {
           'data-git-blame-tip': true,
@@ -418,8 +465,10 @@ window.__ModuleLoader__.load({
             top: `${Math.round(tipTop)}px`,
             right: `${Math.round(tipRight)}px`,
             zIndex: 2147483000,
+            display: 'inline-flex',
+            alignItems: 'center',
             padding: '4px 8px',
-            maxWidth: '240px',
+            maxWidth: '280px',
             whiteSpace: 'nowrap',
             fontSize: '12px',
             lineHeight: 1.4,
@@ -430,7 +479,7 @@ window.__ModuleLoader__.load({
             boxShadow: 'var(--dsw-elevation-prominent)',
             pointerEvents: 'none',
           },
-        }, tipText)
+        }, ...tipChildren)
         : null;
 
       return h(React.Fragment, null, button, tooltip);
@@ -732,10 +781,52 @@ window.__ModuleLoader__.load({
             { name: 'sidebar.right.tab.document.actions', id: 'git-blame-toggle', order: 40 },
             BlameToggle,
           )));
+
+      // Shortcut command (Option 1: registered unbound; users assign a key in Settings).
+      let shortcuts;
+      try {
+        shortcuts = ctx.shortcuts;
+      } catch (_error) {
+        shortcuts = undefined;
+      }
+      if (shortcuts && typeof shortcuts.register === 'function') {
+        ctx.effect(() => {
+          let disposeCommand;
+          try {
+            disposeCommand = shortcuts.register({
+              id: SHORTCUT_COMMAND_ID,
+              label: () => '显示/关闭 Git Blame 气泡',
+              regions: ['page'],
+              modals: [],
+              defaults: {},
+              resolve: () => ({ status: 'handled', run: () => setEnabled(!isEnabled()) }),
+            });
+          } catch (_error) {
+            return undefined;
+          }
+          const catalog = shortcuts.catalog;
+          const sync = () => {
+            try {
+              const rows = catalog && typeof catalog.getSnapshot === 'function' ? catalog.getSnapshot() : [];
+              const row = Array.isArray(rows) ? rows.find((candidate) => candidate.id === SHORTCUT_COMMAND_ID) : undefined;
+              setShortcutHint(row ? { keys: Array.isArray(row.keys) ? row.keys : [], aria: row.aria } : { keys: [], aria: undefined });
+            } catch (_error) {
+              setShortcutHint({ keys: [], aria: undefined });
+            }
+          };
+          const disposeSubscribe = catalog && typeof catalog.subscribe === 'function' ? catalog.subscribe(sync) : () => {};
+          sync();
+          return () => {
+            disposeSubscribe();
+            setShortcutHint({ keys: [], aria: undefined });
+            if (disposeCommand) disposeCommand();
+          };
+        });
+      }
     }
 
     return {
-      inject: ['slots'],
+      inject: ['slots', 'shortcuts'],
       apply,
     };
   },

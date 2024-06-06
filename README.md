@@ -20,6 +20,10 @@ A toggle button in the preview header turns the hover bubble on or off and
 remembers the choice. Both the toggle and the bubble only appear for files that
 are **text and tracked by Git**; untracked or binary files show neither.
 
+A shortcut command **"显示/关闭 Git Blame 气泡"** is registered but left unbound;
+assign it a key in Settings → Shortcuts, and the current keycaps appear in the
+toggle's tooltip.
+
 ## Notes
 
 - The preview is read-only, so the interaction uses the mouse pointer rather
