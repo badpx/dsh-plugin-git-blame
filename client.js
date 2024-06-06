@@ -351,34 +351,40 @@ window.__ModuleLoader__.load({
       h('line', { x1: 4.6, y1: 8.4, x2: 9.2, y2: 8.4 }),
       enabled ? null : h('line', { x1: 2.4, y1: 13.4, x2: 13.6, y2: 2.6 }));
 
-      return h('button', {
-        ref: buttonRef,
-        type: 'button',
-        title,
-        'aria-label': title,
-        'aria-pressed': enabled,
-        'data-git-blame-toggle': enabled ? 'on' : 'off',
-        onClick: () => setEnabled(!isEnabled()),
-        onMouseEnter: () => setHover(true),
-        onMouseLeave: () => setHover(false),
-        style: {
-          width: '28px',
-          height: '28px',
-          flex: 'none',
-          display: 'inline-flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          padding: '6px',
-          margin: '0',
-          visibility: support === 'yes' ? 'visible' : 'hidden',
-          color: enabled ? 'var(--dsw-alias-label-secondary)' : 'var(--dsw-alias-label-tertiary)',
-          background: hover ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
-          border: 'none',
-          borderRadius: 'var(--dsw-radius-sm)',
-          cursor: 'pointer',
-          opacity: enabled ? 1 : 0.72,
-        },
-      }, icon);
+      const styleTag = h('style', { key: 'git-blame-toggle-order' },
+        '[data-textpreview-state="text"] [data-textpreview-path]{order:-2}');
+
+      return h(React.Fragment, null,
+        styleTag,
+        h('button', {
+          ref: buttonRef,
+          type: 'button',
+          title,
+          'aria-label': title,
+          'aria-pressed': enabled,
+          'data-git-blame-toggle': enabled ? 'on' : 'off',
+          onClick: () => setEnabled(!isEnabled()),
+          onMouseEnter: () => setHover(true),
+          onMouseLeave: () => setHover(false),
+          style: {
+            width: '28px',
+            height: '28px',
+            flex: 'none',
+            order: -1,
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '6px',
+            margin: '0',
+            visibility: support === 'yes' ? 'visible' : 'hidden',
+            color: enabled ? 'var(--dsw-alias-label-secondary)' : 'var(--dsw-alias-label-tertiary)',
+            background: hover ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+            border: 'none',
+            borderRadius: 'var(--dsw-radius-sm)',
+            cursor: 'pointer',
+            opacity: enabled ? 1 : 0.72,
+          },
+        }, icon));
     }
 
     function apply(ctx) {
