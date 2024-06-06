@@ -299,7 +299,11 @@ window.__ModuleLoader__.load({
       const [enabled, setEnabledUi] = React.useState(isEnabled());
       const [hover, setHover] = React.useState(false);
       const [support, setSupport] = React.useState('unknown');
+      const [tipOpen, setTipOpen] = React.useState(false);
+      const [tipTop, setTipTop] = React.useState(0);
+      const [tipRight, setTipRight] = React.useState(0);
       const buttonRef = React.useRef(null);
+      const tipTimerRef = React.useRef(0);
       React.useEffect(() => subscribeEnabled(() => setEnabledUi(isEnabled())), []);
       React.useEffect(() => {
         let active = true;
@@ -331,9 +335,28 @@ window.__ModuleLoader__.load({
         };
       }, []);
 
+      React.useEffect(() => () => clearTimeout(tipTimerRef.current), []);
+
+      const openTip = () => {
+        clearTimeout(tipTimerRef.current);
+        tipTimerRef.current = setTimeout(() => {
+          const element = buttonRef.current;
+          if (!element) return;
+          const rect = element.getBoundingClientRect();
+          setTipTop(rect.bottom + 6);
+          setTipRight(Math.max(8, window.innerWidth - rect.right));
+          setTipOpen(true);
+        }, 350);
+      };
+
+      const closeTip = () => {
+        clearTimeout(tipTimerRef.current);
+        setTipOpen(false);
+      };
+
       if (support === 'no') return null;
 
-      const title = enabled ? 'Git Blame 气泡：开（点击关闭）' : 'Git Blame 气泡：关（点击开启）';
+      const tipText = enabled ? '关闭git blame显示' : '打开git blame显示';
       const icon = h('svg', {
         viewBox: '0 0 16 16',
         width: 15,
@@ -351,40 +374,66 @@ window.__ModuleLoader__.load({
       h('line', { x1: 4.6, y1: 8.4, x2: 9.2, y2: 8.4 }),
       enabled ? null : h('line', { x1: 2.4, y1: 13.4, x2: 13.6, y2: 2.6 }));
 
-      const styleTag = h('style', { key: 'git-blame-toggle-order' },
-        '[data-textpreview-state="text"] [data-textpreview-path]{order:-2}');
+      const button = h('button', {
+        ref: buttonRef,
+        type: 'button',
+        'aria-label': tipText,
+        'aria-pressed': enabled,
+        'data-git-blame-toggle': enabled ? 'on' : 'off',
+        onClick: () => setEnabled(!isEnabled()),
+        onMouseEnter: () => {
+          setHover(true);
+          openTip();
+        },
+        onMouseLeave: () => {
+          setHover(false);
+          closeTip();
+        },
+        onFocus: openTip,
+        onBlur: closeTip,
+        style: {
+          width: '28px',
+          height: '28px',
+          flex: 'none',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '6px',
+          margin: '0',
+          visibility: support === 'yes' ? 'visible' : 'hidden',
+          color: enabled ? 'var(--dsw-alias-label-secondary)' : 'var(--dsw-alias-label-tertiary)',
+          background: hover ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+          border: 'none',
+          borderRadius: 'var(--dsw-radius-sm)',
+          cursor: 'pointer',
+          opacity: enabled ? 1 : 0.72,
+        },
+      }, icon);
 
-      return h(React.Fragment, null,
-        styleTag,
-        h('button', {
-          ref: buttonRef,
-          type: 'button',
-          title,
-          'aria-label': title,
-          'aria-pressed': enabled,
-          'data-git-blame-toggle': enabled ? 'on' : 'off',
-          onClick: () => setEnabled(!isEnabled()),
-          onMouseEnter: () => setHover(true),
-          onMouseLeave: () => setHover(false),
+      const tooltip = tipOpen
+        ? h('div', {
+          'data-git-blame-tip': true,
           style: {
-            width: '28px',
-            height: '28px',
-            flex: 'none',
-            order: -1,
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '6px',
-            margin: '0',
-            visibility: support === 'yes' ? 'visible' : 'hidden',
-            color: enabled ? 'var(--dsw-alias-label-secondary)' : 'var(--dsw-alias-label-tertiary)',
-            background: hover ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
-            border: 'none',
+            position: 'fixed',
+            top: `${Math.round(tipTop)}px`,
+            right: `${Math.round(tipRight)}px`,
+            zIndex: 2147483000,
+            padding: '4px 8px',
+            maxWidth: '240px',
+            whiteSpace: 'nowrap',
+            fontSize: '12px',
+            lineHeight: 1.4,
+            color: 'var(--dsw-alias-label-primary)',
+            background: 'var(--dsw-alias-bg-layer-2)',
+            border: '0.5px solid var(--dsw-alias-border-l3)',
             borderRadius: 'var(--dsw-radius-sm)',
-            cursor: 'pointer',
-            opacity: enabled ? 1 : 0.72,
+            boxShadow: 'var(--dsw-elevation-prominent)',
+            pointerEvents: 'none',
           },
-        }, icon));
+        }, tipText)
+        : null;
+
+      return h(React.Fragment, null, button, tooltip);
     }
 
     function apply(ctx) {
