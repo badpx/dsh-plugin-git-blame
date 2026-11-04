@@ -48,11 +48,13 @@ either `{ "type": "npm" }` or a git entry pinned to a full 40-hex commit:
 }
 ```
 
-Host the index over https (e.g. this repo served via GitHub Pages / raw URL) and
-add that URL in the Discover/Settings UI. After publishing to npm you can switch a
-version to `"source": { "type": "npm" }` (the installer builds the exact
-`name@version`). Git sources are commit-pinned, so refresh the `commit` on each
-release.
+Host the index over https and add that URL in the Discover/Settings UI. This
+repository ships a ready-made [`market-index.json`](./market-index.json); add its
+raw URL
+`https://raw.githubusercontent.com/badpx/dsh-plugin-git-blame/main/market-index.json`
+as an index source. After publishing to npm you can switch a version to
+`"source": { "type": "npm" }` (the installer builds the exact `name@version`).
+Git sources are commit-pinned, so refresh the `commit` on each release.
 
 ## How it works
 

@@ -1,0 +1,34 @@
+{
+  "format": 1,
+  "title": { "en": "badpx DSH plugins", "zh": "badpx 的 DSH 插件" },
+  "description": {
+    "en": "Plugins for DeepSeek Harness.",
+    "zh": "DeepSeek Harness 插件合集。"
+  },
+  "plugins": [
+    {
+      "name": "dsh-plugin-git-blame",
+      "title": { "en": "Git Blame", "zh": "Git Blame 悬停" },
+      "description": {
+        "en": "Inline git blame gutter before the line numbers of the right-sidebar file preview, with a hover bubble for the commit summary.",
+        "zh": "在右侧栏文件预览的行号前注入 Git Blame 列，悬停显示该行的提交信息。"
+      },
+      "author": "badpx",
+      "homepage": "https://github.com/badpx/dsh-plugin-git-blame#readme",
+      "repository": { "url": "https://github.com/badpx/dsh-plugin-git-blame" },
+      "icon": "https://raw.githubusercontent.com/badpx/dsh-plugin-git-blame/main/icon.svg",
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1793802925,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/badpx/dsh-plugin-git-blame",
+            "commit": "7cdfd73ebc5f1cf779d6907fd2499491a14663a4"
+          },
+          "engines": { "dsh": "^0.2.1-rc.5" }
+        }
+      ]
+    }
+  ]
+}
