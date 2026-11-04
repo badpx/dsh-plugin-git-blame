@@ -221,6 +221,7 @@ window.__ModuleLoader__.load({
         const signature = `${info.sha || ''}|${dateText}|${authorText}`;
         if (span.dataset.sig === signature) return;
         span.dataset.sig = signature;
+        span.dataset.sha = info.sha || '';
         span.style.background = gutterColor(info.sha);
         span.textContent = '';
         const dateElement = document.createElement('span');
@@ -740,7 +741,7 @@ window.__ModuleLoader__.load({
             cacheRef.current.set(key, { data, ts: Date.now() });
           };
 
-          const fetchBlame = (key, file, line, version) => {
+          const fetchBlame = (key, cacheKey, file, line, version) => {
             const seq = ++seqRef.current;
             fetch(buildUrl(file.sessionId, file.path, line, version), {
               credentials: 'same-origin',
@@ -748,9 +749,11 @@ window.__ModuleLoader__.load({
             })
               .then((response) => response.json().catch(() => ({ ok: false, message: `HTTP ${response.status}` })))
               .then((data) => {
+                // Cache even if this request was superseded: the payload is keyed
+                // by (file + commit), so it stays valid for other rows of that commit.
+                if (data && data.ok) cacheSet(cacheKey, data);
                 if (seq !== seqRef.current) return;
                 if (!tipRef.current || tipRef.current.key !== key) return;
-                if (data && data.ok) cacheSet(key, data);
                 publish({
                   ...tipRef.current,
                   status: data && data.ok ? 'ok' : 'error',
@@ -765,7 +768,7 @@ window.__ModuleLoader__.load({
               });
           };
 
-          const showLine = async (base, file, line, x, y) => {
+          const showLine = async (base, file, line, x, y, cacheKeyHint) => {
             const my = ++showSeqRef.current;
             const status = await fetchFileStatus(file);
             // Superseded by a newer line or by hiding.
@@ -776,16 +779,20 @@ window.__ModuleLoader__.load({
               return;
             }
             const version = status.version;
+            // Identity of the hovered line (used to detect "same hover target").
             const key = `${base}@${version}`;
-            const cached = cacheGet(key);
+            // Blame data is shared per (file + commit): consecutive lines from the
+            // same commit reuse one cache entry, so moving across them never refetches.
+            const cacheKey = cacheKeyHint || key;
+            const cached = cacheGet(cacheKey);
             if (cached !== undefined) {
-              publish({ key, base, x, y, line, status: 'ok', data: cached });
+              publish({ key, base, cacheKey, x, y, line, status: 'ok', data: cached });
               return;
             }
-            publish({ key, base, x, y, line, status: 'loading' });
+            publish({ key, base, cacheKey, x, y, line, status: 'loading' });
             clearTimeout(timerRef.current);
             timerRef.current = setTimeout(() => {
-              if (tipRef.current && tipRef.current.key === key) fetchBlame(key, file, line, version);
+              if (tipRef.current && tipRef.current.key === key) fetchBlame(key, cacheKey, file, line, version);
             }, FETCH_DELAY_MS);
           };
 
@@ -820,8 +827,15 @@ window.__ModuleLoader__.load({
               if (current.x !== x || current.y !== y) publish({ ...current, x, y });
               return;
             }
+            // Share one cache entry per (file + commit): rows from the same commit
+            // show instantly without refetching. Uncommitted rows (all-zero SHA)
+            // vary per line, so they fall back to per-line identity.
+            const sha = gutter.dataset.sha || '';
+            const cacheKeyHint = sha && !/^0+$/.test(sha)
+              ? `${file.contentId}#commit:${sha}`
+              : '';
             // Show immediately — no dwell delay when entering the gutter.
-            showLine(base, file, line, x, y);
+            showLine(base, file, line, x, y, cacheKeyHint);
           };
 
           let lastMoveAt = 0;

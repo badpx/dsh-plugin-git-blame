@@ -44,14 +44,19 @@ toggle's tooltip.
   any pointer movement restores it.
 - The commit message is shown as a bold first-line title plus a normal body; the
   body is capped at 5 lines and ends with an ellipsis when truncated.
-- Results are cached per file+line for the lifetime of the page.
+- Blame is shared per file+commit: consecutive rows belonging to the same commit
+  reuse a single cache entry, so moving the pointer across them is instant and
+  triggers no reload. Uncommitted rows keep per-line caching.
 
 ## Caching
 
-- **Client blame cache**: a bounded LRU (2000 entries, 600 s TTL) keyed by
-  `file address + content version + line`. Each entry is re-validated by a cheap
-  file-version probe (Git blob hash, itself reused for ~1 s), so editing or
-  committing a file invalidates its lines instead of serving stale blame.
+- **Client blame cache**: a bounded LRU (2000 entries, 600 s TTL). For committed
+  rows the key is `file address + commit SHA`, so every row of one commit shares
+  a single entry and moving the pointer across those rows is instant (no reload).
+  Uncommitted rows are keyed by `file address + content version + line`. A cheap
+  file-version probe (Git blob hash, reused for ~1 s) still runs per hover, so
+  switching branches or editing shifts each line to the right commit and stale
+  blame is never served.
 - **Host commit-message cache**: keyed by full commit SHA with a 500-entry LRU.
   Failures are never cached, so a transient `git show` error is retried.
 - Files outside a Git repository, or lines that are not tracked, show a short
