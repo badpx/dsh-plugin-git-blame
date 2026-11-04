@@ -36,9 +36,10 @@ toggle's tooltip.
 
 - The preview is read-only, so the interaction uses the mouse pointer rather
   than a text caret.
-- Rest on a line for ~0.5 s and the bubble appears. Once shown it stays while
-  the pointer remains inside the right-sidebar column (it follows onto other
-  lines), and disappears ~0.5 s after the pointer leaves that column.
+- Hovering the blame gutter column shows the bubble immediately; leaving the
+  column hides it immediately.
+- The bubble follows just below the cursor. When there is not enough room near
+  the bottom edge it flips above the cursor while keeping the same gap.
 - The card is slightly translucent (opacity 0.85). After ~9 s without pointer
   movement it fades over 1 s to opacity 0.15 so it stops hiding the code below;
   any pointer movement restores it.

@@ -647,6 +647,8 @@ window.__ModuleLoader__.load({
         const [tip, setTip] = React.useState(null);
         const [dimmed, setDimmed] = React.useState(false);
         const [enabled, setEnabledUi] = React.useState(isEnabled());
+        const [cardHeight, setCardHeight] = React.useState(0);
+        const cardRef = React.useRef(null);
         const tipRef = React.useRef(null);
         const hideRef = React.useRef(null);
         const cacheRef = React.useRef(new Map());
@@ -878,16 +880,33 @@ window.__ModuleLoader__.load({
           if (!value && hideRef.current) hideRef.current();
         }), []);
 
+        // Measure the rendered card so the "above" fallback keeps the same gap.
+        React.useLayoutEffect(() => {
+          const node = cardRef.current;
+          if (!node) return;
+          const measured = node.getBoundingClientRect().height;
+          setCardHeight((prev) => (Math.abs(prev - measured) > 0.5 ? measured : prev));
+        }, [tip]);
+
         if (!enabled) return null;
         if (tip === null) return null;
 
         const viewportWidth = window.innerWidth || 1280;
         const viewportHeight = window.innerHeight || 800;
-        const left = Math.max(8, Math.min(tip.x + 16, viewportWidth - CARD_WIDTH - 8));
-        const top = tip.y + 18 + 110 > viewportHeight ? Math.max(8, tip.y - 110 - 10) : tip.y + 18;
+        const EDGE_MARGIN = 8;
+        // Gap between the cursor and the card edge (same below and above).
+        const CURSOR_GAP = 18;
+        const left = Math.max(EDGE_MARGIN, Math.min(tip.x + 16, viewportWidth - CARD_WIDTH - EDGE_MARGIN));
+        // Prefer below the cursor; when there is not enough room, flip above while
+        // keeping the same gap (card bottom sits CURSOR_GAP above the cursor).
+        const fitsBelow = tip.y + CURSOR_GAP + cardHeight <= viewportHeight - EDGE_MARGIN;
+        const top = fitsBelow
+          ? tip.y + CURSOR_GAP
+          : Math.max(EDGE_MARGIN, tip.y - CURSOR_GAP - cardHeight);
 
         return h('div', {
           'data-git-blame-card': true,
+          ref: cardRef,
           style: {
             position: 'fixed',
             left: `${left}px`,
