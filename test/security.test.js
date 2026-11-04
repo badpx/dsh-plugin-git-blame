@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { mkdtemp, writeFile, symlink, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, symlink, rm, stat } from 'node:fs/promises';
 import { unlinkSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -39,15 +39,20 @@ async function callRoute(ctx, url) {
   return { status: res.statusCode, body: JSON.parse(res.body) };
 }
 
-test('readSafeFile reads a regular file and fingerprints exactly its bytes (P1-3)', async () => {
+test('readSafeFile classifies text cheaply and reads bytes only on demand (P1-3)', async () => {
   const dir = await makeRepo();
   try {
     const file = path.join(dir, 'f.txt');
     await writeFile(file, 'hello\n');
-    const safe = await readSafeFile(dir, file);
-    assert.equal(safe.ok, true);
-    assert.equal(safe.text, true);
-    assert.equal(contentHash(safe.buffer), sha('hello\n'));
+    const metaOnly = await readSafeFile(dir, file);
+    assert.equal(metaOnly.ok, true);
+    assert.equal(metaOnly.text, true);
+    assert.equal(metaOnly.buffer, undefined, 'status path must not read the whole file');
+    assert.equal(metaOnly.size, 6);
+
+    const withBytes = await readSafeFile(dir, file, { readContents: true });
+    assert.equal(contentHash(withBytes.buffer), sha('hello\n'));
+    assert.equal(withBytes.buffer.length, 6);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -77,10 +82,12 @@ test('status hashes the safely-opened file even if the path is swapped to a syml
     await writeFile(file, original);
     git(dir, ['add', '.']);
     git(dir, ['commit', '-q', '-m', 'c1']);
+    const originalStat = await stat(file);
     await writeFile(path.join(outside, 'secret.txt'), secret);
+    const secretStat = await stat(path.join(outside, 'secret.txt'));
 
     // Swap the path to an out-of-session symlink right as git runs ls-files,
-    // i.e. after readSafeFile already captured the bytes.
+    // i.e. after readSafeFile already captured the opened file's metadata/bytes.
     const ctx = makeCtx({
       cwd: dir,
       overrides: (spec) => {
@@ -99,9 +106,11 @@ test('status hashes the safely-opened file even if the path is swapped to a syml
     const { body } = await callRoute(ctx, '/plugin/git-blame/status?sessionId=s&path=f.txt');
     assert.equal(body.ok, true);
     assert.equal(body.tracked, true);
-    const fingerprint = body.version.split(':')[1];
-    assert.equal(fingerprint, sha(original), 'fingerprint must be of the original safe bytes');
-    assert.notEqual(fingerprint, sha(secret), 'must not fingerprint the swapped-in secret');
+    const parts = body.version.split(':');
+    assert.equal(parts[1], String(originalStat.size), 'size must be of the opened original file');
+    assert.equal(parts[2], String(originalStat.mtimeMs), 'mtime must be of the opened original file');
+    const secretFingerprint = `${secretStat.size}:${secretStat.mtimeMs}`;
+    assert.notEqual(`${parts[1]}:${parts[2]}`, secretFingerprint, 'must not describe the swapped-in secret');
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });

@@ -493,7 +493,7 @@ window.__ModuleLoader__.load({
             if (observer) observer.disconnect();
             observed = preview;
             observer = new MutationObserver(scheduleImmediate);
-            observer.observe(preview, { childList: true, subtree: true });
+            observer.observe(preview, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-textpreview-url'] });
           }
           const address = preview && preview.dataset ? preview.dataset.textpreviewUrl : undefined;
           const parsed = address ? parseFileAddress(address) : undefined;
@@ -524,7 +524,7 @@ window.__ModuleLoader__.load({
 
         evaluate();
         // Poll for branch switches / edits (version changes) while mounted.
-        pollTimer = setInterval(evaluate, 1500);
+        pollTimer = setInterval(evaluate, 1000);
         return () => {
           active = false;
           clearTimeout(debounce);
@@ -562,7 +562,7 @@ window.__ModuleLoader__.load({
           observer = new MutationObserver(schedule);
           observer.observe(preview, { childList: true, subtree: true });
           observer.takeRecords();
-          for (const delay of [120, 400, 900, 1600]) {
+          for (const delay of [120, 450, 900]) {
             retries.push(setTimeout(() => {
               if (!cancelled && lines) syncGutterDom(preview, lines);
             }, delay));

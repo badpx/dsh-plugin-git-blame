@@ -145,13 +145,15 @@ function contentHash(buffer) {
 
 /**
  * Open the file safely (no symlink at the final component) and read it through
- * that single descriptor: `fstat` confirms a regular file, `realpath` confirms it
- * stays in the session directory, and the bytes used for text detection and the
- * content hash come from the descriptor, not a re-openable path. This closes the
- * check-then-swap race where the path is replaced by a symlink after validation.
- * @returns {Promise<{ ok: boolean, buffer?: Buffer, text?: boolean }>}
+ * that single descriptor: `fstat` confirms a regular file and supplies the size /
+ * mtime used for the version, `realpath` confirms it stays in the session
+ * directory, and the text probe reads only the first 8 KiB. Full bytes are read
+ * only when the caller needs them (blame via `--contents`). This closes the
+ * check-then-swap race while keeping status cheap even for large files.
+ * @param {{ readContents?: boolean }} [options]
+ * @returns {Promise<{ ok: boolean, text?: boolean, size?: number, mtimeMs?: number, buffer?: Buffer }>}
  */
-async function readSafeFile(cwd, absolutePath) {
+async function readSafeFile(cwd, absolutePath, options = {}) {
   let handle;
   try {
     handle = await fsp.open(absolutePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
@@ -160,8 +162,23 @@ async function readSafeFile(cwd, absolutePath) {
     const real = await fsp.realpath(absolutePath);
     const root = await fsp.realpath(path.resolve(cwd));
     if (real !== root && !real.startsWith(root + path.sep)) return { ok: false };
-    const buffer = await handle.readFile();
-    return { ok: true, buffer, text: looksTextBuffer(buffer) };
+
+    const headLen = Math.min(stats.size, 8192);
+    const head = Buffer.alloc(headLen);
+    if (headLen > 0) await handle.read(head, 0, headLen, 0);
+
+    const safe = { ok: true, text: looksTextBuffer(head), size: stats.size, mtimeMs: stats.mtimeMs };
+    if (options.readContents) {
+      const buffer = Buffer.alloc(stats.size);
+      let offset = 0;
+      while (offset < stats.size) {
+        const { bytesRead } = await handle.read(buffer, offset, stats.size - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      safe.buffer = buffer;
+    }
+    return safe;
   } catch {
     return { ok: false };
   } finally {
@@ -170,8 +187,9 @@ async function readSafeFile(cwd, absolutePath) {
 }
 
 /**
- * Snapshot version = HEAD commit + content fingerprint of the safe-read bytes.
- * Both a branch switch (HEAD changes) and an edit (bytes change) invalidate it.
+ * Snapshot version = HEAD commit + the opened file's size and mtime. A branch
+ * switch changes HEAD and an edit changes mtime (and usually size), so the version
+ * invalidates when blame can change — without hashing the whole file on every poll.
  * @returns {Promise<string>}
  */
 async function snapshotVersion(ctx, cwd, safe, options = {}) {
@@ -180,8 +198,9 @@ async function snapshotVersion(ctx, cwd, safe, options = {}) {
     maxStdoutBytes: 4096,
   });
   const head = headResult.ok && !headResult.stdoutLossy ? headResult.stdout.trim() : '';
-  const fingerprint = safe && safe.buffer ? contentHash(safe.buffer) : '';
-  return `${head}:${fingerprint}`;
+  const size = safe && typeof safe.size === 'number' ? safe.size : '';
+  const mtime = safe && safe.mtimeMs !== undefined ? String(safe.mtimeMs) : '';
+  return `${head}:${size}:${mtime}`;
 }
 
 /**
@@ -554,10 +573,9 @@ async function handleRequest(ctx, req, res) {
       return;
     }
 
-    // One safe open: the same descriptor supplies validation, text detection, the
-    // content hash, and the blame input, so a path swapped after the check cannot
-    // make git read a different (possibly outside) file.
-    const safe = await readSafeFile(cwd, absolutePath);
+    // One safe open per request: status needs only fs metadata + a text probe,
+    // while the blame routes also need the full bytes (fed to git via --contents).
+    const safe = await readSafeFile(cwd, absolutePath, { readContents: !isStatusRequest });
     if (!safe.ok) {
       if (isStatusRequest) {
         // Not eligible (symlink/non-regular/missing): answer a settled "no" so the
