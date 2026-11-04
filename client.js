@@ -34,6 +34,32 @@ window.__ModuleLoader__.load({
         : '';
     }
 
+    /**
+     * Snapshot-version notifier. When a file's version changes (branch switch or
+     * edit) the toggle records it; the overlay subscribes so an already-open
+     * bubble for that file is dismissed instead of showing a stale commit.
+     */
+    const versionListeners = new Set();
+    const knownVersions = new Map();
+    function onVersionChange(listener) {
+      versionListeners.add(listener);
+      return () => versionListeners.delete(listener);
+    }
+    function recordFileVersion(contentId, version) {
+      if (!contentId || typeof version !== 'string' || version === '') return;
+      const prev = knownVersions.get(contentId);
+      if (prev !== undefined && prev !== version) {
+        for (const listener of versionListeners) {
+          try {
+            listener(contentId, version);
+          } catch (_error) {
+            /* ignore */
+          }
+        }
+      }
+      knownVersions.set(contentId, version);
+    }
+
     /** Persisted on/off switch shared by the toolbar toggle and the overlay. */
     const ENABLED_STORAGE_KEY = 'dsh.git-blame-hover.enabled';
     const enabledListeners = new Set();
@@ -216,8 +242,9 @@ window.__ModuleLoader__.load({
     }
 
     async function fetchGutterLines(file) {
-      const key = `${file.contentId}@${file.version || ''}`;
-      const cached = gutterCacheGet(key);
+      const requestedVersion = file.version || '';
+      const requestedKey = `${file.contentId}@${requestedVersion}`;
+      const cached = gutterCacheGet(requestedKey);
       if (cached !== undefined) return cached;
       try {
         const response = await fetch(buildFileBlameUrl(file.sessionId, file.path, file.version), {
@@ -225,10 +252,12 @@ window.__ModuleLoader__.load({
           headers: { accept: 'application/json' },
         });
         const data = await response.json().catch(() => null);
-        // Only a successful payload is cached: a transient failure must be retryable
-        // the next time this version is opened or the column is re-enabled.
+        // Only a successful payload is cached: a transient failure must be retryable.
         if (data && data.ok && Array.isArray(data.lines)) {
-          gutterCacheSet(key, data.lines);
+          // Key by the version the host ACTUALLY blamed, not the one requested: a
+          // branch switch during the request must not store B's lines under A's key.
+          const actualVersion = typeof data.version === 'string' && data.version ? data.version : requestedVersion;
+          gutterCacheSet(`${file.contentId}@${actualVersion}`, data.lines);
           return data.lines;
         }
       } catch (_error) {
@@ -573,6 +602,7 @@ window.__ModuleLoader__.load({
               // do not offer the toggle there. Re-checked on every renderer change.
               const hasCodePreview = Boolean(preview && preview.querySelector && preview.querySelector('[data-code-preview]'));
               const eligible = status.tracked && status.text && hasCodePreview;
+              if (status.tracked && status.text) recordFileVersion(address, status.version || '');
               setSupport(eligible ? 'yes' : 'no');
               setFileInfo((prev) => {
                 if (!eligible) return null;
@@ -657,8 +687,9 @@ window.__ModuleLoader__.load({
         setTipOpen(false);
       };
 
-      if (support === 'no') return null;
-
+      // Keep the button mounted even when this preview is not eligible: it is the
+      // stable anchor used to re-find the preview container. Its visibility is
+      // controlled by `support` below, so code ineligible -> plain -> code recovers.
       const tipText = enabled ? '关闭git blame显示' : '打开git blame显示';
       const icon = h('svg', {
         viewBox: '0 0 16 16',
@@ -936,10 +967,10 @@ window.__ModuleLoader__.load({
             const cacheKey = commitCacheKey(file.contentId, lineSha) || key;
             const cached = cacheGet(cacheKey);
             if (cached !== undefined) {
-              publish({ key, base, cacheKey, x, y, line, status: 'ok', data: cached });
+              publish({ key, base, contentId: file.contentId, version, cacheKey, x, y, line, status: 'ok', data: cached });
               return;
             }
-            publish({ key, base, cacheKey, x, y, line, status: 'loading' });
+            publish({ key, base, contentId: file.contentId, version, cacheKey, x, y, line, status: 'loading' });
             clearTimeout(timerRef.current);
             timerRef.current = setTimeout(() => {
               if (tipRef.current && tipRef.current.key === key) fetchBlame(key, cacheKey, file, line, version);
@@ -972,14 +1003,9 @@ window.__ModuleLoader__.load({
             }
 
             const base = `${file.contentId}#${line}`;
-            const current = tipRef.current;
-            if (current && current.base === base) {
-              if (current.x !== x || current.y !== y) publish({ ...current, x, y });
-              return;
-            }
-            // Show immediately — no dwell delay when entering the gutter. The line's
-            // commit is resolved inside showLine from the whole-file mapping for the
-            // current version, so a stale `data-sha` on the DOM cannot mislead it.
+            // Always re-resolve, even for the same line: a branch switch or edit
+            // may have changed the line's commit, and `showLine` re-verifies the
+            // version and re-maps the line instead of trusting the current tip.
             showLine(base, file, line, x, y);
           };
 
@@ -1021,6 +1047,13 @@ window.__ModuleLoader__.load({
           const value = isEnabled();
           setEnabledUi(value);
           if (!value && hideRef.current) hideRef.current();
+        }), []);
+
+        // A branch switch / edit changes a file's snapshot version: dismiss an open
+        // bubble for that file so it cannot keep showing the previous commit.
+        React.useEffect(() => onVersionChange((contentId) => {
+          const current = tipRef.current;
+          if (current && current.contentId === contentId && hideRef.current) hideRef.current();
         }), []);
 
         // Measure the rendered card so the "above" fallback keeps the same gap.

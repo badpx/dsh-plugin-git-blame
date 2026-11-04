@@ -115,9 +115,10 @@ toggle's tooltip.
   rows the key is `file address + commit SHA`, so every row of one commit shares
   a single entry and moving the pointer across those rows is instant (no reload).
   Uncommitted rows are keyed by `file address + content version + line`. The
-  snapshot version is `HEAD + file size + mtime` from one safe open (reused for
-  ~1 s), so switching branches or editing shifts each line to the right commit and
-  stale blame is never served — without hashing whole files on every probe.
+  snapshot version is `HEAD + file size + mtime + ctime` from one safe open (reused
+  for ~1 s), and the host confirms HEAD is unchanged across the read and blame, so
+  switching branches or editing shifts each line to the right commit and stale
+  blame is never served — without hashing whole files on every probe.
 - **Host commit-message cache**: keyed by full commit SHA with a 500-entry LRU.
   Failures are never cached, so a transient `git show` error is retried.
 - Files outside a Git repository, or lines that are not tracked, show a short

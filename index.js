@@ -144,35 +144,47 @@ function contentHash(buffer) {
 }
 
 /**
- * Open the file safely (no symlink at the final component) and read it through
- * that single descriptor: `fstat` confirms a regular file and supplies the size /
- * mtime used for the version, `realpath` confirms it stays in the session
- * directory, and the text probe reads only the first 8 KiB. Full bytes are read
- * only when the caller needs them (blame via `--contents`). This closes the
- * check-then-swap race while keeping status cheap even for large files.
+ * Open the file safely and read it through that single descriptor. Flags:
+ * `O_NOFOLLOW` rejects a final-component symlink, `O_NONBLOCK` keeps a FIFO from
+ * blocking `open()`, `fstat` confirms a regular file and supplies size/mtime/ctime
+ * for the version, `realpath` confirms containment, and a dev/ino comparison binds
+ * the resolved path to the very inode we opened — so swapping a PARENT directory
+ * between open() and realpath() cannot pass an outside object off as inside. Text
+ * probing reads only the first 8 KiB; full bytes are read only for blame.
  * @param {{ readContents?: boolean }} [options]
- * @returns {Promise<{ ok: boolean, text?: boolean, size?: number, mtimeMs?: number, buffer?: Buffer }>}
+ * @returns {Promise<{ ok: boolean, text?: boolean, size?: number, mtimeNs?: bigint, ctimeNs?: bigint, buffer?: Buffer }>}
  */
 async function readSafeFile(cwd, absolutePath, options = {}) {
   let handle;
   try {
-    handle = await fsp.open(absolutePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
-    const stats = await handle.stat();
+    const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0) | (fsConstants.O_NONBLOCK || 0);
+    handle = await fsp.open(absolutePath, flags);
+    const stats = await handle.stat({ bigint: true });
     if (!stats.isFile()) return { ok: false };
     const real = await fsp.realpath(absolutePath);
     const root = await fsp.realpath(path.resolve(cwd));
     if (real !== root && !real.startsWith(root + path.sep)) return { ok: false };
+    // Bind the opened object to the resolved path: it must be the same inode.
+    const pathStats = await fsp.stat(real, { bigint: true });
+    if (pathStats.dev !== stats.dev || pathStats.ino !== stats.ino) return { ok: false };
 
-    const headLen = Math.min(stats.size, 8192);
+    const size = Number(stats.size);
+    const headLen = Math.min(size, 8192);
     const head = Buffer.alloc(headLen);
     if (headLen > 0) await handle.read(head, 0, headLen, 0);
 
-    const safe = { ok: true, text: looksTextBuffer(head), size: stats.size, mtimeMs: stats.mtimeMs };
+    const safe = {
+      ok: true,
+      text: looksTextBuffer(head),
+      size,
+      mtimeNs: stats.mtimeNs,
+      ctimeNs: stats.ctimeNs,
+    };
     if (options.readContents) {
-      const buffer = Buffer.alloc(stats.size);
+      const buffer = Buffer.alloc(size);
       let offset = 0;
-      while (offset < stats.size) {
-        const { bytesRead } = await handle.read(buffer, offset, stats.size - offset, offset);
+      while (offset < size) {
+        const { bytesRead } = await handle.read(buffer, offset, size - offset, offset);
         if (bytesRead === 0) break;
         offset += bytesRead;
       }
@@ -186,21 +198,52 @@ async function readSafeFile(cwd, absolutePath, options = {}) {
   }
 }
 
+/** Current HEAD commit (empty when the repository has no commit yet). */
+async function headSha(ctx, cwd, signal) {
+  const result = await runGit(ctx, cwd, ['git', '-C', cwd, 'rev-parse', '--verify', 'HEAD'], {
+    signal,
+    maxStdoutBytes: 4096,
+  });
+  return result.ok && !result.stdoutLossy ? result.stdout.trim() : '';
+}
+
+/** Snapshot version from an explicit HEAD and a safely-read file. */
+function versionFromHead(head, safe) {
+  const size = safe && typeof safe.size === 'number' ? safe.size : '';
+  const mtime = safe && safe.mtimeNs !== undefined ? String(safe.mtimeNs) : '';
+  const ctime = safe && safe.ctimeNs !== undefined ? String(safe.ctimeNs) : '';
+  return `${head}:${size}:${mtime}:${ctime}`;
+}
+
 /**
- * Snapshot version = HEAD commit + the opened file's size and mtime. A branch
- * switch changes HEAD and an edit changes mtime (and usually size), so the version
- * invalidates when blame can change — without hashing the whole file on every poll.
+ * Snapshot version = HEAD commit + the opened file's size + mtime + ctime. A
+ * branch switch changes HEAD; an edit changes mtime (and ctime even if a tool
+ * restores mtime and keeps the size). Cheap: metadata only, no whole-file hash.
  * @returns {Promise<string>}
  */
 async function snapshotVersion(ctx, cwd, safe, options = {}) {
-  const headResult = await runGit(ctx, cwd, ['git', '-C', cwd, 'rev-parse', '--verify', 'HEAD'], {
-    signal: options.signal,
-    maxStdoutBytes: 4096,
-  });
-  const head = headResult.ok && !headResult.stdoutLossy ? headResult.stdout.trim() : '';
-  const size = safe && typeof safe.size === 'number' ? safe.size : '';
-  const mtime = safe && safe.mtimeMs !== undefined ? String(safe.mtimeMs) : '';
-  return `${head}:${size}:${mtime}`;
+  return versionFromHead(await headSha(ctx, cwd, options.signal), safe);
+}
+
+/**
+ * Run `work(head, safe)` on a safely-read file while HEAD is confirmed unchanged
+ * before and after, so the returned version truly describes what blame used.
+ * Returns `{ unstable: true }` when a branch switch races the request.
+ */
+async function withStableHead(ctx, cwd, absolutePath, readContents, work, signal) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const head1 = await headSha(ctx, cwd, signal);
+    const safe = await readSafeFile(cwd, absolutePath, { readContents });
+    if (!safe.ok) return { unsafe: true };
+    const head2 = await headSha(ctx, cwd, signal);
+    if (head1 !== head2) continue;
+    const value = await work(head1, safe);
+    const head3 = await headSha(ctx, cwd, signal);
+    if (head1 !== head3) continue;
+    if (value && value.ok) value.version = versionFromHead(head1, safe);
+    return { value };
+  }
+  return { unstable: true };
 }
 
 /**
@@ -573,33 +616,51 @@ async function handleRequest(ctx, req, res) {
       return;
     }
 
-    // One safe open per request: status needs only fs metadata + a text probe,
-    // while the blame routes also need the full bytes (fed to git via --contents).
-    const safe = await readSafeFile(cwd, absolutePath, { readContents: !isStatusRequest });
-    if (!safe.ok) {
-      if (isStatusRequest) {
-        // Not eligible (symlink/non-regular/missing): answer a settled "no" so the
-        // client stops polling instead of retrying forever.
-        sendJson(res, 200, { ok: true, tracked: false, text: false, version: '' });
-      } else {
-        sendJson(res, 403, { ok: false, message: 'File is not a regular file inside the session directory' });
-      }
-      return;
-    }
-
     if (isStatusRequest) {
+      // Confirm HEAD is unchanged across the safe read, so `version` describes it.
+      let snapshot;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const head1 = await headSha(ctx, cwd, signal);
+        const safe = await readSafeFile(cwd, absolutePath);
+        if (!safe.ok) {
+          // Not eligible (symlink/non-regular/missing/FIFO): settled "no".
+          sendJson(res, 200, { ok: true, tracked: false, text: false, version: '' });
+          return;
+        }
+        const head2 = await headSha(ctx, cwd, signal);
+        if (head1 === head2) {
+          snapshot = { head: head1, safe };
+          break;
+        }
+      }
+      if (!snapshot) {
+        sendJson(res, 409, { ok: false, code: 'version-changed', message: 'Repository changed during the request' });
+        return;
+      }
       const relative = path.relative(cwd, absolutePath) || path.basename(absolutePath);
       const trackedResult = await runGit(ctx, cwd, ['git', '-C', cwd, 'ls-files', '--error-unmatch', '--', relative], { signal });
       const tracked = trackedResult.ok;
-      const text = isTextExtension(absolutePath) && safe.text;
-      const version = tracked ? await snapshotVersion(ctx, cwd, safe, { signal }) : '';
+      const text = isTextExtension(absolutePath) && snapshot.safe.text;
+      const version = tracked ? versionFromHead(snapshot.head, snapshot.safe) : '';
       sendJson(res, 200, { ok: true, tracked, text, version });
       return;
     }
 
     if (isFileRequest) {
-      const fileResult = await blameFile(ctx, cwd, absolutePath, { signal, contentsBuffer: safe.buffer });
-      sendJson(res, 200, fileResult);
+      const stable = await withStableHead(
+        ctx, cwd, absolutePath, true,
+        (_head, safe) => blameFile(ctx, cwd, absolutePath, { signal, contentsBuffer: safe.buffer }),
+        signal,
+      );
+      if (stable.unsafe) {
+        sendJson(res, 403, { ok: false, message: 'File is not a regular file inside the session directory' });
+        return;
+      }
+      if (stable.unstable) {
+        sendJson(res, 409, { ok: false, code: 'version-changed', message: 'Repository changed during the request' });
+        return;
+      }
+      sendJson(res, 200, stable.value);
       return;
     }
 
@@ -609,12 +670,20 @@ async function handleRequest(ctx, req, res) {
       return;
     }
 
-    const providedVersion = url.searchParams.get('version') || '';
-    const result = await blameLine(ctx, cwd, absolutePath, line, { signal, contentsBuffer: safe.buffer });
-    if (result.ok) {
-      result.version = providedVersion || await snapshotVersion(ctx, cwd, safe, { signal });
+    const stable = await withStableHead(
+      ctx, cwd, absolutePath, true,
+      (_head, safe) => blameLine(ctx, cwd, absolutePath, line, { signal, contentsBuffer: safe.buffer }),
+      signal,
+    );
+    if (stable.unsafe) {
+      sendJson(res, 403, { ok: false, message: 'File is not a regular file inside the session directory' });
+      return;
     }
-    sendJson(res, 200, result);
+    if (stable.unstable) {
+      sendJson(res, 409, { ok: false, code: 'version-changed', message: 'Repository changed during the request' });
+      return;
+    }
+    sendJson(res, 200, stable.value);
   } catch (error) {
     sendJson(res, 500, { ok: false, message: String((error && error.message) || error) });
   }
@@ -644,6 +713,9 @@ export {
   looksTextBuffer,
   contentHash,
   readSafeFile,
+  headSha,
+  versionFromHead,
+  withStableHead,
   snapshotVersion,
   fileVersion,
   commitMessage,
