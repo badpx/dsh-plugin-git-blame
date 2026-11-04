@@ -105,13 +105,19 @@ toggle's tooltip.
 
 ## Caching
 
-- **Client blame cache**: a bounded LRU (2000 entries, 600 s TTL). For committed
+- **Whole-file blame cache (`gutterCache`)**: an in-memory LRU keyed by
+  `file address + snapshot version`, holding the parsed per-line array the gutter
+  renders. Bounded by a **64 MB byte budget, at most 200 entries**, and a single
+  file whose line data exceeds 16 MB is not cached; least-recently-used entries
+  are evicted (no clear-all cliff). A hit means re-opening a file needs no
+  `git blame`.
+- **Client bubble cache**: a bounded LRU (2000 entries, 600 s TTL). For committed
   rows the key is `file address + commit SHA`, so every row of one commit shares
   a single entry and moving the pointer across those rows is instant (no reload).
-  Uncommitted rows are keyed by `file address + content version + line`. A cheap
-  file-version probe (Git blob hash, reused for ~1 s) still runs per hover, so
-  switching branches or editing shifts each line to the right commit and stale
-  blame is never served.
+  Uncommitted rows are keyed by `file address + content version + line`. The
+  snapshot version is `HEAD + file size + mtime` from one safe open (reused for
+  ~1 s), so switching branches or editing shifts each line to the right commit and
+  stale blame is never served — without hashing whole files on every probe.
 - **Host commit-message cache**: keyed by full commit SHA with a 500-entry LRU.
   Failures are never cached, so a transient `git show` error is retried.
 - Files outside a Git repository, or lines that are not tracked, show a short

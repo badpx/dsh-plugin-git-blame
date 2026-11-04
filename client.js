@@ -100,12 +100,16 @@ window.__ModuleLoader__.load({
 
     /** Short-lived per-file status cache: git-tracked? text? content version? */
     const STATUS_TTL_MS = 1000;
+    const STATUS_CACHE_MAX_ENTRIES = 500;
     const statusCache = new Map();
     const statusInflight = new Map();
 
     async function fetchFileStatus(file) {
       const cached = statusCache.get(file.contentId);
-      if (cached !== undefined && Date.now() - cached.ts <= STATUS_TTL_MS) return cached.value;
+      if (cached !== undefined) {
+        if (Date.now() - cached.ts <= STATUS_TTL_MS) return cached.value;
+        statusCache.delete(file.contentId); // drop expired so the map stays bounded
+      }
       const inflight = statusInflight.get(file.contentId);
       if (inflight !== undefined) return inflight;
       const request = (async () => {
@@ -127,6 +131,10 @@ window.__ModuleLoader__.load({
         } catch (_error) {
           /* leave determined=false so callers can retry */
         }
+        if (!statusCache.has(file.contentId) && statusCache.size >= STATUS_CACHE_MAX_ENTRIES) {
+          const oldest = statusCache.keys().next();
+          if (!oldest.done) statusCache.delete(oldest.value);
+        }
         statusCache.set(file.contentId, { value, ts: Date.now() });
         statusInflight.delete(file.contentId);
         return value;
@@ -141,8 +149,63 @@ window.__ModuleLoader__.load({
 
     const GUTTER_WIDTH = 150;
     const GUTTER_STYLE_ID = 'dsh-git-blame-gutter-style';
-    const GUTTER_CACHE_LIMIT = 100;
+    /** Byte budget for the whole-file blame cache (parsed per-line arrays). */
+    const GUTTER_CACHE_MAX_BYTES = 64 * 1024 * 1024; // 64 MB
+    /** Hard entry cap regardless of size (protects many tiny files). */
+    const GUTTER_CACHE_MAX_ENTRIES = 200;
+    /** A single file whose parsed line array exceeds this is not cached. */
+    const GUTTER_CACHE_ENTRY_MAX_BYTES = 16 * 1024 * 1024; // 16 MB
+    /** LRU: key -> { lines, bytes }. Insertion order is the recency order. */
     const gutterCache = new Map();
+    let gutterCacheBytes = 0;
+
+    /** Rough byte size of one parsed per-line blame array, for the cache budget. */
+    function estimateGutterBytes(lines) {
+      if (!Array.isArray(lines)) return 0;
+      let bytes = 32;
+      for (const entry of lines) {
+        if (!entry) {
+          bytes += 8;
+          continue;
+        }
+        bytes += 72;
+        if (entry.sha) bytes += entry.sha.length;
+        if (entry.shortSha) bytes += entry.shortSha.length;
+        if (entry.author) bytes += entry.author.length * 2;
+        if (entry.date) bytes += entry.date.length;
+      }
+      return bytes;
+    }
+
+    /** LRU get: touch recency on hit. */
+    function gutterCacheGet(key) {
+      const entry = gutterCache.get(key);
+      if (entry === undefined) return undefined;
+      gutterCache.delete(key);
+      gutterCache.set(key, entry);
+      return entry.lines;
+    }
+
+    /** LRU set with a total byte budget and entry cap; evicts least-recently-used. */
+    function gutterCacheSet(key, lines) {
+      const bytes = estimateGutterBytes(lines);
+      if (bytes > GUTTER_CACHE_ENTRY_MAX_BYTES || bytes > GUTTER_CACHE_MAX_BYTES) return;
+      if (gutterCache.has(key)) {
+        gutterCacheBytes -= gutterCache.get(key).bytes;
+        gutterCache.delete(key);
+      }
+      while (
+        gutterCache.size > 0
+        && (gutterCacheBytes + bytes > GUTTER_CACHE_MAX_BYTES || gutterCache.size >= GUTTER_CACHE_MAX_ENTRIES)
+      ) {
+        const oldest = gutterCache.keys().next();
+        if (oldest.done) break;
+        gutterCacheBytes -= gutterCache.get(oldest.value).bytes;
+        gutterCache.delete(oldest.value);
+      }
+      gutterCache.set(key, { lines, bytes });
+      gutterCacheBytes += bytes;
+    }
 
     function buildFileBlameUrl(sessionId, filePath, version) {
       const url = new URL('plugin/git-blame/file', document.baseURI);
@@ -154,7 +217,7 @@ window.__ModuleLoader__.load({
 
     async function fetchGutterLines(file) {
       const key = `${file.contentId}@${file.version || ''}`;
-      const cached = gutterCache.get(key);
+      const cached = gutterCacheGet(key);
       if (cached !== undefined) return cached;
       try {
         const response = await fetch(buildFileBlameUrl(file.sessionId, file.path, file.version), {
@@ -165,8 +228,7 @@ window.__ModuleLoader__.load({
         // Only a successful payload is cached: a transient failure must be retryable
         // the next time this version is opened or the column is re-enabled.
         if (data && data.ok && Array.isArray(data.lines)) {
-          if (gutterCache.size >= GUTTER_CACHE_LIMIT) gutterCache.clear();
-          gutterCache.set(key, data.lines);
+          gutterCacheSet(key, data.lines);
           return data.lines;
         }
       } catch (_error) {
