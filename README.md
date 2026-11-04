@@ -109,8 +109,9 @@ toggle's tooltip.
   `file address + snapshot version`, holding the parsed per-line array the gutter
   renders. Bounded by a **64 MB byte budget, at most 200 entries**, and a single
   file whose line data exceeds 16 MB is not cached; least-recently-used entries
-  are evicted (no clear-all cliff). A hit means re-opening a file needs no
-  `git blame`.
+  are evicted (no clear-all cliff). Concurrent reads of the same file+version are
+  coalesced into one request, and the bubble reuses the mapping the sidebar already
+  holds — so even a too-large-to-cache file never refetches blame per hover.
 - **Client bubble cache**: a bounded LRU (2000 entries, 600 s TTL). For committed
   rows the key is `file address + commit SHA`, so every row of one commit shares
   a single entry and moving the pointer across those rows is instant (no reload).

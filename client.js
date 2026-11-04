@@ -233,6 +233,12 @@ window.__ModuleLoader__.load({
       gutterCacheBytes += bytes;
     }
 
+    /** Coalesce concurrent whole-file reads for the same file + version. */
+    const gutterInflight = new Map();
+    /** The line mapping the gutter currently shows for the open preview, so the
+     *  bubble can reuse it even when a huge mapping is too large to cache. */
+    let activePreviewMapping = null;
+
     function buildFileBlameUrl(sessionId, filePath, version) {
       const url = new URL('plugin/git-blame/file', document.baseURI);
       url.searchParams.set('sessionId', sessionId);
@@ -241,29 +247,42 @@ window.__ModuleLoader__.load({
       return url.href;
     }
 
+    /**
+     * Fetch the whole-file blame mapping. Returns `{ lines, version }` where
+     * `version` is the snapshot the host actually blamed. Concurrent calls for the
+     * same file+version share one request, and a successful payload is cached under
+     * the ACTUAL version (never under a stale requested one).
+     */
     async function fetchGutterLines(file) {
       const requestedVersion = file.version || '';
       const requestedKey = `${file.contentId}@${requestedVersion}`;
       const cached = gutterCacheGet(requestedKey);
-      if (cached !== undefined) return cached;
-      try {
-        const response = await fetch(buildFileBlameUrl(file.sessionId, file.path, file.version), {
-          credentials: 'same-origin',
-          headers: { accept: 'application/json' },
-        });
-        const data = await response.json().catch(() => null);
-        // Only a successful payload is cached: a transient failure must be retryable.
-        if (data && data.ok && Array.isArray(data.lines)) {
-          // Key by the version the host ACTUALLY blamed, not the one requested: a
-          // branch switch during the request must not store B's lines under A's key.
-          const actualVersion = typeof data.version === 'string' && data.version ? data.version : requestedVersion;
-          gutterCacheSet(`${file.contentId}@${actualVersion}`, data.lines);
-          return data.lines;
+      if (cached !== undefined) return { lines: cached, version: requestedVersion };
+      const inflight = gutterInflight.get(requestedKey);
+      if (inflight !== undefined) return inflight;
+      const request = (async () => {
+        try {
+          const response = await fetch(buildFileBlameUrl(file.sessionId, file.path, file.version), {
+            credentials: 'same-origin',
+            headers: { accept: 'application/json' },
+          });
+          const data = await response.json().catch(() => null);
+          if (data && data.ok && Array.isArray(data.lines)) {
+            const actualVersion = typeof data.version === 'string' && data.version ? data.version : requestedVersion;
+            gutterCacheSet(`${file.contentId}@${actualVersion}`, data.lines);
+            return { lines: data.lines, version: actualVersion };
+          }
+        } catch (_error) {
+          /* do not cache the failure */
         }
-      } catch (_error) {
-        /* fall through: do not cache the failure */
+        return { lines: [], version: requestedVersion };
+      })();
+      gutterInflight.set(requestedKey, request);
+      try {
+        return await request;
+      } finally {
+        gutterInflight.delete(requestedKey);
       }
-      return [];
     }
 
     function ensureGutterStyle() {
@@ -647,9 +666,17 @@ window.__ModuleLoader__.load({
             if (observer) observer.takeRecords();
           });
         };
-        fetchGutterLines(fileInfo).then((data) => {
+        fetchGutterLines(fileInfo).then((result) => {
           if (cancelled) return;
-          lines = Array.isArray(data) ? data : [];
+          const mapping = result && Array.isArray(result.lines) ? result : { lines: [], version: fileInfo.version };
+          lines = mapping.lines;
+          // Expose this mapping to the bubble so it can reuse the very lines the
+          // column already holds — even when they are too large to cache.
+          activePreviewMapping = {
+            contentId: fileInfo.contentId,
+            version: mapping.version || fileInfo.version,
+            lines,
+          };
           syncGutterDom(preview, lines);
           observer = new MutationObserver(schedule);
           observer.observe(preview, { childList: true, subtree: true });
@@ -667,6 +694,9 @@ window.__ModuleLoader__.load({
           for (const timer of retries) clearTimeout(timer);
           preview.classList.remove('gb-gutter-on');
           clearGutterDom(preview);
+          if (activePreviewMapping && activePreviewMapping.contentId === fileInfo.contentId) {
+            activePreviewMapping = null;
+          }
         };
       }, [enabled, support, fileInfo && fileInfo.contentId, fileInfo && fileInfo.version]);
 
@@ -946,34 +976,44 @@ window.__ModuleLoader__.load({
               if (tipRef.current !== null) hide();
               return;
             }
-            const version = status.version;
-            // Identity of the hovered line (used to detect "same hover target").
-            const key = `${base}@${version}`;
-            // Authoritative line -> SHA for THIS version: use the same whole-file
-            // mapping the gutter shows (shared cache), not the possibly stale
-            // `data-sha` on an already-rendered column. A branch switch or edit
-            // therefore re-resolves the line's commit instead of reusing the old one.
-            let lineSha = '';
-            try {
-              const lines = await fetchGutterLines({ ...file, version });
-              const entry = Array.isArray(lines) ? lines[line - 1] : undefined;
-              if (entry && typeof entry.sha === 'string') lineSha = entry.sha;
-            } catch (_error) {
-              lineSha = '';
+            const requestedVersion = status.version;
+            let effectiveVersion = requestedVersion;
+            let lines;
+            // Prefer the mapping the sidebar already holds for this exact version:
+            // no per-hover request, and it works even for a huge mapping that is too
+            // large for the byte-budget cache. Otherwise fetch (de-duplicated) one.
+            if (
+              activePreviewMapping
+              && activePreviewMapping.contentId === file.contentId
+              && activePreviewMapping.version === requestedVersion
+            ) {
+              lines = activePreviewMapping.lines;
+            } else {
+              try {
+                const mapping = await fetchGutterLines({ ...file, version: requestedVersion });
+                lines = mapping.lines;
+                if (mapping.version) effectiveVersion = mapping.version;
+              } catch (_error) {
+                lines = [];
+              }
             }
             if (my !== showSeqRef.current) return;
+            // Identity of the hovered line (used to detect "same hover target").
+            const key = `${base}@${effectiveVersion}`;
+            const entry = Array.isArray(lines) ? lines[line - 1] : undefined;
+            const lineSha = entry && typeof entry.sha === 'string' ? entry.sha : '';
             // A commit's message is shared across its rows; an uncommitted/all-zero
             // (or unknown) SHA falls back to per-line identity.
             const cacheKey = commitCacheKey(file.contentId, lineSha) || key;
             const cached = cacheGet(cacheKey);
             if (cached !== undefined) {
-              publish({ key, base, contentId: file.contentId, version, cacheKey, x, y, line, status: 'ok', data: cached });
+              publish({ key, base, contentId: file.contentId, version: effectiveVersion, cacheKey, x, y, line, status: 'ok', data: cached });
               return;
             }
-            publish({ key, base, contentId: file.contentId, version, cacheKey, x, y, line, status: 'loading' });
+            publish({ key, base, contentId: file.contentId, version: effectiveVersion, cacheKey, x, y, line, status: 'loading' });
             clearTimeout(timerRef.current);
             timerRef.current = setTimeout(() => {
-              if (tipRef.current && tipRef.current.key === key) fetchBlame(key, cacheKey, file, line, version);
+              if (tipRef.current && tipRef.current.key === key) fetchBlame(key, cacheKey, file, line, effectiveVersion);
             }, FETCH_DELAY_MS);
           };
 
