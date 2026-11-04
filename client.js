@@ -235,9 +235,10 @@ window.__ModuleLoader__.load({
 
     /** Coalesce concurrent whole-file reads for the same file + version. */
     const gutterInflight = new Map();
-    /** The line mapping the gutter currently shows for the open preview, so the
-     *  bubble can reuse it even when a huge mapping is too large to cache. */
-    let activePreviewMapping = null;
+    /** The line mapping each open preview currently shows, keyed by its preview
+     *  DOM node (WeakMap so a split-pane preview never overwrites another and both
+     *  are released with the DOM). Lets the bubble reuse huge, uncacheable arrays. */
+    const previewMappings = new WeakMap();
 
     function buildFileBlameUrl(sessionId, filePath, version) {
       const url = new URL('plugin/git-blame/file', document.baseURI);
@@ -425,7 +426,7 @@ window.__ModuleLoader__.load({
       if (typeof contentId !== 'string' || contentId === '') return undefined;
       const parsed = parseFileAddress(contentId);
       if (!parsed || parsed.scope !== 'session') return undefined;
-      return { sessionId: parsed.sessionId, path: parsed.path, contentId };
+      return { sessionId: parsed.sessionId, path: parsed.path, contentId, preview };
     }
 
     function buildUrl(sessionId, filePath, line, version) {
@@ -670,13 +671,13 @@ window.__ModuleLoader__.load({
           if (cancelled) return;
           const mapping = result && Array.isArray(result.lines) ? result : { lines: [], version: fileInfo.version };
           lines = mapping.lines;
-          // Expose this mapping to the bubble so it can reuse the very lines the
-          // column already holds — even when they are too large to cache.
-          activePreviewMapping = {
+          // Bind this mapping to this preview node so a split-pane preview does
+          // not overwrite another preview's mapping.
+          previewMappings.set(preview, {
             contentId: fileInfo.contentId,
             version: mapping.version || fileInfo.version,
             lines,
-          };
+          });
           syncGutterDom(preview, lines);
           observer = new MutationObserver(schedule);
           observer.observe(preview, { childList: true, subtree: true });
@@ -694,9 +695,7 @@ window.__ModuleLoader__.load({
           for (const timer of retries) clearTimeout(timer);
           preview.classList.remove('gb-gutter-on');
           clearGutterDom(preview);
-          if (activePreviewMapping && activePreviewMapping.contentId === fileInfo.contentId) {
-            activePreviewMapping = null;
-          }
+          previewMappings.delete(preview);
         };
       }, [enabled, support, fileInfo && fileInfo.contentId, fileInfo && fileInfo.version]);
 
@@ -979,15 +978,16 @@ window.__ModuleLoader__.load({
             const requestedVersion = status.version;
             let effectiveVersion = requestedVersion;
             let lines;
-            // Prefer the mapping the sidebar already holds for this exact version:
-            // no per-hover request, and it works even for a huge mapping that is too
-            // large for the byte-budget cache. Otherwise fetch (de-duplicated) one.
+            // Prefer the mapping THIS preview already holds for this exact version:
+            // no per-hover request, works even for a huge mapping too large to cache,
+            // and a split-pane preview's mapping is looked up by its own DOM node.
+            const heldMapping = file.preview ? previewMappings.get(file.preview) : undefined;
             if (
-              activePreviewMapping
-              && activePreviewMapping.contentId === file.contentId
-              && activePreviewMapping.version === requestedVersion
+              heldMapping
+              && heldMapping.contentId === file.contentId
+              && heldMapping.version === requestedVersion
             ) {
-              lines = activePreviewMapping.lines;
+              lines = heldMapping.lines;
             } else {
               try {
                 const mapping = await fetchGutterLines({ ...file, version: requestedVersion });
