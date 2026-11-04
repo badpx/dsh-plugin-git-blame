@@ -37,6 +37,10 @@
   "engines": {
     "dsh": "^0.2.1-rc.5"
   },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
