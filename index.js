@@ -1,13 +1,13 @@
 /**
  * Host half of the Git Blame on Hover plugin.
  *
- * It registers one HTTP route the Web client calls while the pointer rests on a
- * source line inside the right-sidebar file preview. The route resolves the
- * Session's working directory, runs `git blame --line-porcelain` for exactly
- * that line, then reads the full commit message, and answers with small JSON
- * describing the commit.
+ * It registers the HTTP routes the Web client calls while the pointer rests on a
+ * source line inside the right-sidebar file preview. The routes resolve the
+ * Session's working directory, run `git blame --line-porcelain`, then read the
+ * commit message, and answer with small JSON describing the commit.
  */
 import path from 'node:path';
+import { promises as fsp } from 'node:fs';
 
 /** Route prefix; keep in sync with the Client half. */
 const ROUTE_PATH = '/plugin/git-blame';
@@ -15,12 +15,25 @@ const ROUTE_PATH = '/plugin/git-blame';
 /** Services this plugin needs before it can activate. */
 export const inject = ['webServer', 'sessions', 'workingDirectory', 'subprocess'];
 
-/** Bound every git invocation so a stuck repository cannot pin a request. */
+/** Execution deadline for one git invocation. */
 const GIT_TIMEOUT_MS = 8000;
+/** Grace given after a termination signal before the process is killed hard. */
+const GIT_KILL_GRACE_MS = 2000;
+
+/** A full object name: SHA-1 (40) or SHA-256 (64) lowercase hex. */
+const SHA_SOURCE = '(?:[0-9a-f]{40}|[0-9a-f]{64})';
+const SHA_RE = new RegExp(`^${SHA_SOURCE}$`);
+/** First porcelain line: `<sha> <orig-line> <final-line> [<num-lines>]`. */
+const PORCELAIN_HEADER_RE = new RegExp(`^\\^?(${SHA_SOURCE}) \\d+ \\d+(?: \\d+)?$`);
+/** One full-porcelain record header (final-line is captured for placement). */
+const FULL_HEADER_RE = new RegExp(`^\\^?(${SHA_SOURCE})\\s+\\d+\\s+(\\d+)(?:\\s+\\d+)?\\s*$`);
 
 /** Small cache of commit messages, keyed by full SHA. */
 const MESSAGE_CACHE_LIMIT = 500;
 const messageCache = new Map();
+
+/** Maximum lines returned by the whole-file blame route. */
+const MAX_BLAME_FILE_LINES = 50000;
 
 /** File suffixes treated as non-text (binary, media, office, images). */
 const NON_TEXT_EXTENSIONS = new Set([
@@ -32,10 +45,37 @@ const NON_TEXT_EXTENSIONS = new Set([
   'mp3', 'wav', 'ogg', 'flac', 'mp4', 'mov', 'avi', 'mkv', 'webm',
 ]);
 
-/** Extension-based text check; unknown extensions count as text (the preview does the same). */
-function isTextPath(filePath) {
+/** Extension-based fast reject; unknown extensions are then inspected by content. */
+function isTextExtension(filePath) {
   const ext = path.extname(filePath).slice(1).toLowerCase();
   return !NON_TEXT_EXTENSIONS.has(ext);
+}
+
+/**
+ * Decide whether a file looks like text: reject known-binary extensions, then
+ * scan the first 8 KiB for NUL bytes / a high share of control bytes. This
+ * catches binary files with a text-looking extension (e.g. a `.dat` with NULs).
+ * @returns {Promise<boolean>}
+ */
+async function isProbablyText(absolutePath) {
+  if (!isTextExtension(absolutePath)) return false;
+  let handle;
+  try {
+    handle = await fsp.open(absolutePath, 'r');
+    const buffer = Buffer.alloc(8192);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const slice = buffer.subarray(0, bytesRead);
+    if (slice.includes(0)) return false;
+    let control = 0;
+    for (const byte of slice) {
+      if (byte < 9 || (byte > 13 && byte < 32)) control += 1;
+    }
+    return bytesRead === 0 || control / bytesRead < 0.3;
+  } catch {
+    return false;
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
 }
 
 /**
@@ -53,25 +93,48 @@ function sendJson(res, status, body) {
 }
 
 /**
- * Resolve the absolute file path for one Session, refusing paths that escape
- * the Session's working directory.
+ * Resolve the requested path against the Session's working directory, refusing
+ * strings that escape it. Symlink/real-path checks happen separately.
  * @returns {string | undefined}
  */
-function resolveFile(ctx, session, requestedPath) {
-  const cwd = ctx.workingDirectory.get(session);
+function resolveFile(cwd, requestedPath) {
+  const root = path.resolve(cwd);
   const absolute = path.isAbsolute(requestedPath)
     ? path.normalize(requestedPath)
-    : path.resolve(cwd, requestedPath);
-  const root = path.resolve(cwd);
+    : path.resolve(root, requestedPath);
   if (absolute !== root && !absolute.startsWith(root + path.sep)) return undefined;
   return absolute;
 }
 
 /**
- * Run one managed git command and collect its output.
- * @returns {Promise<{ ok: boolean, exitCode?: number | null, stdout: string, stderr: string, message?: string }>}
+ * Ensure the resolved file is a regular, non-symlink file whose real path stays
+ * inside the Session working directory. Prevents a tracked symlink from reading
+ * a file outside the session.
+ * @returns {Promise<boolean>}
  */
-async function runGit(ctx, cwd, argv, maxStdoutBytes = 1024 * 1024) {
+async function isSafeRealFile(cwd, absolutePath) {
+  try {
+    const stats = await fsp.lstat(absolutePath);
+    if (stats.isSymbolicLink() || !stats.isFile()) return false;
+    const real = await fsp.realpath(absolutePath);
+    const root = await fsp.realpath(path.resolve(cwd));
+    return real === root || real.startsWith(root + path.sep);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Run one managed git command and collect its output.
+ * @returns {Promise<{ ok: boolean, exitCode?: number | null, stdout: string, stderr: string,
+ *   stdoutLossy: boolean, stderrLossy: boolean, timedOut: boolean, message?: string }>}
+ */
+async function runGit(ctx, cwd, argv, options = {}) {
+  const maxStdoutBytes = options.maxStdoutBytes ?? 1024 * 1024;
+  const timeoutMs = options.timeoutMs ?? GIT_TIMEOUT_MS;
+  const controller = new AbortController();
+  const signal = options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
+  let timedOut = false;
   let handle;
   try {
     handle = ctx.subprocess.spawn({
@@ -82,24 +145,43 @@ async function runGit(ctx, cwd, argv, maxStdoutBytes = 1024 * 1024) {
         stdout: { maxBytes: maxStdoutBytes },
         stderr: { maxBytes: 64 * 1024 },
       },
-      graceMs: GIT_TIMEOUT_MS,
+      graceMs: GIT_KILL_GRACE_MS,
+      signal,
     });
   } catch (error) {
-    return { ok: false, stdout: '', stderr: '', message: String((error && error.message) || error) };
+    return { ok: false, stdout: '', stderr: '', stdoutLossy: false, stderrLossy: false, timedOut, message: String((error && error.message) || error) };
   }
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try {
+      if (handle && typeof handle.terminate === 'function') handle.terminate();
+    } catch {
+      /* ignore */
+    }
+    controller.abort();
+  }, timeoutMs);
 
   let outcome;
   try {
     outcome = await handle.done;
   } catch (error) {
-    return { ok: false, stdout: '', stderr: '', message: String((error && error.message) || error) };
+    clearTimeout(timer);
+    return { ok: false, stdout: '', stderr: '', stdoutLossy: false, stderrLossy: false, timedOut, message: String((error && error.message) || error) };
+  } finally {
+    clearTimeout(timer);
   }
 
+  const outRead = handle.collected && handle.collected.stdout ? handle.collected.stdout.readFrom(0) : undefined;
+  const errRead = handle.collected && handle.collected.stderr ? handle.collected.stderr.readFrom(0) : undefined;
   return {
-    ok: outcome.exitCode === 0,
+    ok: outcome.exitCode === 0 && !timedOut,
     exitCode: outcome.exitCode,
-    stdout: handle.collected.stdout ? handle.collected.stdout.readFrom(0).text : '',
-    stderr: handle.collected.stderr ? handle.collected.stderr.readFrom(0).text : '',
+    stdout: outRead ? outRead.text : '',
+    stderr: errRead ? errRead.text : '',
+    stdoutLossy: Boolean(outRead && outRead.lossy),
+    stderrLossy: Boolean(errRead && errRead.lossy),
+    timedOut,
   };
 }
 
@@ -128,26 +210,41 @@ function messageSet(sha, message) {
 
 /**
  * Read one commit's full message (`%B`), cached by SHA. Failures are not cached.
+ * The SHA is validated and passed after `--end-of-options`, so a crafted value
+ * can never be interpreted as a git option.
  * @returns {Promise<string>}
  */
-async function commitMessage(ctx, cwd, sha) {
+async function commitMessage(ctx, cwd, sha, options = {}) {
+  if (typeof sha !== 'string' || !SHA_RE.test(sha)) return '';
   const cached = messageGet(sha);
   if (cached !== undefined) return cached;
-  const result = await runGit(ctx, cwd, ['git', '-C', cwd, 'show', '-s', '--format=%B', sha]);
-  if (!result.ok) return '';
+  const result = await runGit(
+    ctx,
+    cwd,
+    ['git', '-C', cwd, 'show', '-s', '--format=%B', '--end-of-options', sha],
+    { signal: options.signal, maxStdoutBytes: 256 * 1024 },
+  );
+  if (!result.ok || result.stdoutLossy) return '';
   const message = result.stdout.replace(/\s+$/, '');
   messageSet(sha, message);
   return message;
 }
 
 /**
- * Content version of a working-tree file: its Git blob hash. Changes whenever
- * the file's bytes change (committed or not), so it invalidates stale blame.
+ * Content version of a working-tree file. Combines the current HEAD commit with
+ * the file's Git blob hash so that BOTH a branch switch (same bytes, different
+ * history) and an edit (different bytes) change the version and invalidate blame.
  * @returns {Promise<string>}
  */
-async function fileVersion(ctx, cwd, absolutePath) {
-  const result = await runGit(ctx, cwd, ['git', '-C', cwd, 'hash-object', '--', absolutePath]);
-  return result.ok ? result.stdout.trim() : '';
+async function fileVersion(ctx, cwd, absolutePath, options = {}) {
+  const signal = options.signal;
+  const [blobResult, headResult] = await Promise.all([
+    runGit(ctx, cwd, ['git', '-C', cwd, 'hash-object', '--', absolutePath], { signal, maxStdoutBytes: 4096 }),
+    runGit(ctx, cwd, ['git', '-C', cwd, 'rev-parse', '--verify', 'HEAD'], { signal, maxStdoutBytes: 4096 }),
+  ]);
+  const blob = blobResult.ok && !blobResult.stdoutLossy ? blobResult.stdout.trim() : '';
+  const head = headResult.ok && !headResult.stdoutLossy ? headResult.stdout.trim() : '';
+  return `${head}:${blob}`;
 }
 
 /**
@@ -163,14 +260,18 @@ function splitMessage(message, fallbackTitle) {
 }
 
 /**
- * Parse `git blame --line-porcelain` output for a single line.
- * @param {string} text
+ * Parse `git blame --line-porcelain` output for a single line. The header is
+ * validated strictly (40/64-hex SHA only); anything else is a parse failure, so
+ * truncated or crafted output never yields a value that reaches `git show`.
  * @returns {Record<string, unknown>}
  */
 function parsePorcelain(text) {
-  const header = text.slice(0, text.indexOf('\n') === -1 ? undefined : text.indexOf('\n')).trim();
-  if (header === '') return { ok: false, message: 'git blame returned no output' };
-  const sha = header.split(/\s+/)[0];
+  const newline = text.indexOf('\n');
+  const header = (newline === -1 ? text : text.slice(0, newline)).trim();
+  if (header === '') return { ok: false, code: 'parse-failed', message: 'git blame returned no output' };
+  const match = PORCELAIN_HEADER_RE.exec(header);
+  if (!match) return { ok: false, code: 'parse-failed', message: 'git blame returned an unexpected header' };
+  const sha = match[1];
   const uncommitted = /^0+$/.test(sha);
 
   const info = {
@@ -208,20 +309,23 @@ function parsePorcelain(text) {
 
 /**
  * Parse full `git blame --line-porcelain` output into one entry per source line.
- * @returns {Array<Record<string, unknown> | null>}
+ * Accepts SHA-1 and SHA-256 object ids.
+ * @returns {{ lines: Array<Record<string, unknown> | null>, parsedCount: number }}
  */
 function parseFullPorcelain(text) {
   const out = [];
   let current;
+  let parsedCount = 0;
   for (const raw of text.split('\n')) {
     if (raw.startsWith('\t')) {
       if (current !== undefined) {
         out[current.finalLine - 1] = current.record;
+        parsedCount += 1;
         current = undefined;
       }
       continue;
     }
-    const headerMatch = /^\^?([0-9a-f]{40})\s+\d+\s+(\d+)(?:\s+\d+)?\s*$/.exec(raw);
+    const headerMatch = FULL_HEADER_RE.exec(raw);
     if (headerMatch) {
       const sha = headerMatch[1];
       current = {
@@ -251,19 +355,28 @@ function parseFullPorcelain(text) {
       }
     }
   }
-  const result = [];
-  for (let i = 0; i < out.length; i += 1) result.push(out[i] === undefined ? null : out[i]);
-  return result;
+  const lines = [];
+  for (let i = 0; i < out.length; i += 1) lines.push(out[i] === undefined ? null : out[i]);
+  return { lines, parsedCount };
 }
 
 /**
  * Blame the whole file, returning a per-line array of commit summaries.
  * @returns {Promise<Record<string, unknown>>}
  */
-async function blameFile(ctx, cwd, absolutePath) {
-  const result = await runGit(ctx, cwd, ['git', '-C', cwd, 'blame', '--line-porcelain', '--', absolutePath], 32 * 1024 * 1024);
+async function blameFile(ctx, cwd, absolutePath, options = {}) {
+  const result = await runGit(
+    ctx,
+    cwd,
+    ['git', '-C', cwd, 'blame', '--line-porcelain', '--', absolutePath],
+    { signal: options.signal, maxStdoutBytes: 32 * 1024 * 1024 },
+  );
   if (result.exitCode === undefined) {
     return { ok: false, code: 'spawn-failed', message: result.message };
+  }
+  if (result.timedOut) return { ok: false, code: 'timeout', message: 'git blame timed out' };
+  if (result.stdoutLossy) {
+    return { ok: false, code: 'truncated', message: 'git blame output exceeded the size limit' };
   }
   if (!result.ok) {
     const message = result.stderr.trim() || result.stdout.trim() || 'git blame failed';
@@ -275,25 +388,35 @@ async function blameFile(ctx, cwd, absolutePath) {
     }
     return { ok: false, code: 'git-failed', message: message.split('\n')[0] };
   }
-  const lines = parseFullPorcelain(result.stdout);
-  if (lines.length > 50000) return { ok: false, code: 'too-large', message: 'File is too large for inline blame' };
-  return { ok: true, lines };
+  const parsed = parseFullPorcelain(result.stdout);
+  if (parsed.parsedCount === 0 && result.stdout.trim() !== '') {
+    return { ok: false, code: 'parse-failed', message: 'git blame returned an unexpected output' };
+  }
+  if (parsed.lines.length > MAX_BLAME_FILE_LINES) {
+    return { ok: false, code: 'too-large', message: 'File is too large for inline blame' };
+  }
+  return { ok: true, lines: parsed.lines };
 }
 
 /**
  * Run git blame for one line, then attach the commit message title/body.
  * @returns {Promise<Record<string, unknown>>}
  */
-async function blameLine(ctx, cwd, absolutePath, line) {
-  const result = await runGit(ctx, cwd, [
-    'git', '-C', cwd,
-    'blame', '--line-porcelain', '-L', `${line},${line}`, '--', absolutePath,
-  ]);
+async function blameLine(ctx, cwd, absolutePath, line, options = {}) {
+  const result = await runGit(
+    ctx,
+    cwd,
+    ['git', '-C', cwd, 'blame', '--line-porcelain', '-L', `${line},${line}`, '--', absolutePath],
+    { signal: options.signal },
+  );
 
   if (result.exitCode === undefined) {
     return { ok: false, code: 'spawn-failed', message: result.message };
   }
-
+  if (result.timedOut) return { ok: false, code: 'timeout', message: 'git blame timed out' };
+  if (result.stdoutLossy) {
+    return { ok: false, code: 'truncated', message: 'git blame output exceeded the size limit' };
+  }
   if (!result.ok) {
     const message = result.stderr.trim() || result.stdout.trim() || 'git blame failed';
     if (/not a git repository/i.test(message)) {
@@ -316,7 +439,7 @@ async function blameLine(ctx, cwd, absolutePath, line) {
     return info;
   }
 
-  info.message = await commitMessage(ctx, cwd, info.sha);
+  info.message = await commitMessage(ctx, cwd, info.sha, { signal: options.signal });
   const split = splitMessage(info.message, info.summary);
   info.title = split.title;
   info.body = split.body;
@@ -328,6 +451,12 @@ async function blameLine(ctx, cwd, absolutePath, line) {
  * @param {import('node:http').ServerResponse} res
  */
 async function handleRequest(ctx, req, res) {
+  const requestController = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) requestController.abort();
+  });
+  const signal = requestController.signal;
+
   try {
     const url = new URL(req.url || '/', 'http://localhost');
     const sessionId = url.searchParams.get('sessionId');
@@ -346,26 +475,36 @@ async function handleRequest(ctx, req, res) {
       return;
     }
 
-    const absolutePath = resolveFile(ctx, session, filePath);
+    const cwd = ctx.workingDirectory.get(session);
+    const absolutePath = resolveFile(cwd, filePath);
     if (!absolutePath) {
       sendJson(res, 403, { ok: false, message: 'Path is outside the session working directory' });
       return;
     }
 
-    const cwd = ctx.workingDirectory.get(session);
+    if (!(await isSafeRealFile(cwd, absolutePath))) {
+      if (isStatusRequest) {
+        // Not eligible (symlink/non-regular/missing): answer a settled "no" so the
+        // client stops polling instead of retrying forever.
+        sendJson(res, 200, { ok: true, tracked: false, text: false, version: '' });
+      } else {
+        sendJson(res, 403, { ok: false, message: 'File is not a regular file inside the session directory' });
+      }
+      return;
+    }
 
     if (isStatusRequest) {
       const relative = path.relative(cwd, absolutePath) || path.basename(absolutePath);
-      const trackedResult = await runGit(ctx, cwd, ['git', '-C', cwd, 'ls-files', '--error-unmatch', '--', relative]);
+      const trackedResult = await runGit(ctx, cwd, ['git', '-C', cwd, 'ls-files', '--error-unmatch', '--', relative], { signal });
       const tracked = trackedResult.ok;
-      const text = isTextPath(absolutePath);
-      const version = tracked ? await fileVersion(ctx, cwd, absolutePath) : '';
+      const text = await isProbablyText(absolutePath);
+      const version = tracked ? await fileVersion(ctx, cwd, absolutePath, { signal }) : '';
       sendJson(res, 200, { ok: true, tracked, text, version });
       return;
     }
 
     if (isFileRequest) {
-      const fileResult = await blameFile(ctx, cwd, absolutePath);
+      const fileResult = await blameFile(ctx, cwd, absolutePath, { signal });
       sendJson(res, 200, fileResult);
       return;
     }
@@ -377,9 +516,9 @@ async function handleRequest(ctx, req, res) {
     }
 
     const providedVersion = url.searchParams.get('version') || '';
-    const result = await blameLine(ctx, cwd, absolutePath, line);
+    const result = await blameLine(ctx, cwd, absolutePath, line, { signal });
     if (result.ok) {
-      result.version = providedVersion || await fileVersion(ctx, cwd, absolutePath);
+      result.version = providedVersion || await fileVersion(ctx, cwd, absolutePath, { signal });
     }
     sendJson(res, 200, result);
   } catch (error) {
@@ -399,3 +538,19 @@ export function apply(ctx) {
     }),
   );
 }
+
+// Internals exported for regression tests. The plugin loader only uses `inject`
+// and `apply`; extra named exports are inert.
+export {
+  runGit,
+  resolveFile,
+  isSafeRealFile,
+  isProbablyText,
+  fileVersion,
+  commitMessage,
+  parsePorcelain,
+  parseFullPorcelain,
+  blameFile,
+  blameLine,
+  splitMessage,
+};

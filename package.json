@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Hover the blame gutter in a right-sidebar file preview to see each line's git blame.",
   "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

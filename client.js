@@ -25,6 +25,15 @@ window.__ModuleLoader__.load({
     /** Idle delay before the bubble fades to its dimmed opacity. */
     const IDLE_DIM_MS = 9000;
 
+    /** Full git object id (SHA-1 or SHA-256), never the all-zero "uncommitted" id. */
+    const COMMIT_SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+    /** Cache key sharing one commit's message across the rows that belong to it. */
+    function commitCacheKey(contentId, sha) {
+      return typeof sha === 'string' && COMMIT_SHA_RE.test(sha) && !/^0+$/.test(sha)
+        ? `${contentId}#commit:${sha}`
+        : '';
+    }
+
     /** Persisted on/off switch shared by the toolbar toggle and the overlay. */
     const ENABLED_STORAGE_KEY = 'dsh.git-blame-hover.enabled';
     const enabledListeners = new Set();
@@ -147,20 +156,23 @@ window.__ModuleLoader__.load({
       const key = `${file.contentId}@${file.version || ''}`;
       const cached = gutterCache.get(key);
       if (cached !== undefined) return cached;
-      let lines = [];
       try {
         const response = await fetch(buildFileBlameUrl(file.sessionId, file.path, file.version), {
           credentials: 'same-origin',
           headers: { accept: 'application/json' },
         });
         const data = await response.json().catch(() => null);
-        if (data && data.ok && Array.isArray(data.lines)) lines = data.lines;
+        // Only a successful payload is cached: a transient failure must be retryable
+        // the next time this version is opened or the column is re-enabled.
+        if (data && data.ok && Array.isArray(data.lines)) {
+          if (gutterCache.size >= GUTTER_CACHE_LIMIT) gutterCache.clear();
+          gutterCache.set(key, data.lines);
+          return data.lines;
+        }
       } catch (_error) {
-        lines = [];
+        /* fall through: do not cache the failure */
       }
-      if (gutterCache.size >= GUTTER_CACHE_LIMIT) gutterCache.clear();
-      gutterCache.set(key, lines);
-      return lines;
+      return [];
     }
 
     function ensureGutterStyle() {
@@ -462,6 +474,7 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         let active = true;
         let retryTimer = 0;
+        let attempts = 0;
         const resolve = () => {
           const element = buttonRef.current;
           const preview = element && element.closest ? element.closest('[data-textpreview-url]') : null;
@@ -479,7 +492,17 @@ window.__ModuleLoader__.load({
                 retryTimer = setTimeout(resolve, 1500);
                 return;
               }
-              const eligible = status.tracked && status.text;
+              // The gutter only exists in the highlighted code renderer
+              // (`[data-code-preview]`); plain-text previews have no line nodes, so
+              // do not offer the toggle there. Retry briefly in case the preview
+              // has not rendered yet.
+              const hasCodePreview = Boolean(preview && preview.querySelector && preview.querySelector('[data-code-preview]'));
+              if (status.tracked && status.text && !hasCodePreview && attempts < 10) {
+                attempts += 1;
+                retryTimer = setTimeout(resolve, 200);
+                return;
+              }
+              const eligible = status.tracked && status.text && hasCodePreview;
               setSupport(eligible ? 'yes' : 'no');
               setFileInfo(eligible
                 ? { sessionId: parsed.sessionId, path: parsed.path, contentId: address, version: status.version || '' }
@@ -770,11 +793,23 @@ window.__ModuleLoader__.load({
               .then((data) => {
                 // Cache even if this request was superseded: the payload is keyed
                 // by (file + commit), so it stays valid for other rows of that commit.
-                if (data && data.ok) cacheSet(cacheKey, data);
+                let settledKey = cacheKey;
+                if (data && data.ok) {
+                  // Prefer the SHA the server actually blamed. If it differs from the
+                  // hint taken from the sidebar, the local row mapping was stale: drop
+                  // the poisoned hint entry so it cannot keep serving a wrong author.
+                  const actualKey = commitCacheKey(file.contentId, data.sha);
+                  if (actualKey) {
+                    if (actualKey !== cacheKey) cacheRef.current.delete(cacheKey);
+                    settledKey = actualKey;
+                  }
+                  cacheSet(settledKey, data);
+                }
                 if (seq !== seqRef.current) return;
                 if (!tipRef.current || tipRef.current.key !== key) return;
                 publish({
                   ...tipRef.current,
+                  cacheKey: settledKey,
                   status: data && data.ok ? 'ok' : 'error',
                   data: data && data.ok ? data : undefined,
                   message: data && data.ok ? undefined : (data && data.message) || 'Request failed',
@@ -850,9 +885,7 @@ window.__ModuleLoader__.load({
             // show instantly without refetching. Uncommitted rows (all-zero SHA)
             // vary per line, so they fall back to per-line identity.
             const sha = gutter.dataset.sha || '';
-            const cacheKeyHint = sha && !/^0+$/.test(sha)
-              ? `${file.contentId}#commit:${sha}`
-              : '';
+            const cacheKeyHint = commitCacheKey(file.contentId, sha);
             // Show immediately — no dwell delay when entering the gutter.
             showLine(base, file, line, x, y, cacheKeyHint);
           };
