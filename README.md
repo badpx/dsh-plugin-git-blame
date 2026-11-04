@@ -4,6 +4,56 @@ A DeepSeek Harness plugin. When a text or source file is opened in the right
 sidebar's file preview, hovering a line shows a small card with that line's
 `git blame` information (author, short commit hash, date, and commit summary).
 
+## Install
+
+Requires DeepSeek Harness; this plugin targets DSH `^0.2.1-rc.5`.
+
+- **From npm**: open the Plugins page → **添加插件 / Add plugin** and enter the
+  package name `dsh-plugin-git-blame`, or run `dsh plugin add dsh-plugin-git-blame`.
+- **From this repository (git)**: in the same dialog paste the repository URL, or
+  run `dsh plugin add github:badpx/dsh-plugin-git-blame`.
+
+### Discoverability (plugin market)
+
+DSH does not crawl GitHub or npm on its own. Third-party plugins are surfaced by
+the experimental **plugin market**: a *Discover* tab that reads **plugin market
+index** JSON documents whose URLs you add in Settings. The index follows format 1
+of `@deepseek-ai/dsh-plugin-market-index`; its `plugins[].versions[].source` is
+either `{ "type": "npm" }` or a git entry pinned to a full 40-hex commit:
+
+```json
+{
+  "format": 1,
+  "title": { "en": "My DSH plugins" },
+  "plugins": [
+    {
+      "name": "dsh-plugin-git-blame",
+      "title": { "en": "Git Blame" },
+      "description": { "en": "Inline git blame gutter and hover bubble in the file preview." },
+      "repository": { "url": "https://github.com/badpx/dsh-plugin-git-blame" },
+      "icon": "https://raw.githubusercontent.com/badpx/dsh-plugin-git-blame/main/icon.svg",
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1740000000,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/badpx/dsh-plugin-git-blame",
+            "commit": "<40-hex-commit-sha>"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Host the index over https (e.g. this repo served via GitHub Pages / raw URL) and
+add that URL in the Discover/Settings UI. After publishing to npm you can switch a
+version to `"source": { "type": "npm" }` (the installer builds the exact
+`name@version`). Git sources are commit-pinned, so refresh the `commit` on each
+release.
+
 ## How it works
 
 - **Host** (`index.js`): registers `GET /plugin/git-blame?sessionId=&path=&line=`.

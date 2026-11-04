@@ -8,7 +8,7 @@
  * blame, and paints a small floating card in `shell.overlay`.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-git-blame-hover',
+  id: 'dsh-plugin-git-blame',
   factory(require) {
     const React = require('react');
     const h = React.createElement;

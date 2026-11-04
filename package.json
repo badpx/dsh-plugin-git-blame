@@ -1,9 +1,8 @@
 {
-  "name": "@local/dsh-git-blame-hover",
+  "name": "dsh-plugin-git-blame",
   "version": "0.1.0",
-  "private": true,
+  "description": "Hover the blame gutter in a right-sidebar file preview to see each line's git blame.",
   "type": "module",
-  "description": "Hover a line in a right-sidebar file preview to see its git blame.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -19,6 +18,25 @@
     "icon.svg",
     "README.md"
   ],
+  "keywords": [
+    "dsh-plugin",
+    "dsh-bundle",
+    "deepseek-harness",
+    "cordis",
+    "git-blame",
+    "blame"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/badpx/dsh-plugin-git-blame.git"
+  },
+  "homepage": "https://github.com/badpx/dsh-plugin-git-blame#readme",
+  "bugs": {
+    "url": "https://github.com/badpx/dsh-plugin-git-blame/issues"
+  },
+  "engines": {
+    "dsh": "^0.2.1-rc.5"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
