@@ -473,46 +473,63 @@ window.__ModuleLoader__.load({
       React.useEffect(() => subscribeShortcutHint(() => setShortcut(getShortcutHint())), []);
       React.useEffect(() => {
         let active = true;
-        let retryTimer = 0;
-        let attempts = 0;
-        const resolve = () => {
+        let observer = null;
+        let observed = null;
+        let debounce = 0;
+        let pollTimer = 0;
+
+        const scheduleImmediate = () => {
+          clearTimeout(debounce);
+          debounce = setTimeout(evaluate, 150);
+        };
+
+        const evaluate = () => {
+          if (!active) return;
           const element = buttonRef.current;
           const preview = element && element.closest ? element.closest('[data-textpreview-url]') : null;
+          // Re-bind the observer whenever the preview node changes (e.g. a tab or
+          // renderer switch) so renderer changes are noticed promptly.
+          if (preview && preview !== observed) {
+            if (observer) observer.disconnect();
+            observed = preview;
+            observer = new MutationObserver(scheduleImmediate);
+            observer.observe(preview, { childList: true, subtree: true });
+          }
           const address = preview && preview.dataset ? preview.dataset.textpreviewUrl : undefined;
           const parsed = address ? parseFileAddress(address) : undefined;
           if (!parsed || parsed.scope !== 'session') {
-            if (active) setSupport('no');
+            setSupport('no');
+            setFileInfo(null);
             return;
           }
           fetchFileStatus({ sessionId: parsed.sessionId, path: parsed.path, contentId: address })
             .then((status) => {
               if (!active) return;
-              if (!status.determined) {
-                // Transient failure (e.g. Host not ready): retry soon.
-                retryTimer = setTimeout(resolve, 1500);
-                return;
-              }
+              if (!status.determined) return; // transient; the poll retries
               // The gutter only exists in the highlighted code renderer
               // (`[data-code-preview]`); plain-text previews have no line nodes, so
-              // do not offer the toggle there. Retry briefly in case the preview
-              // has not rendered yet.
+              // do not offer the toggle there. Re-checked on every renderer change.
               const hasCodePreview = Boolean(preview && preview.querySelector && preview.querySelector('[data-code-preview]'));
-              if (status.tracked && status.text && !hasCodePreview && attempts < 10) {
-                attempts += 1;
-                retryTimer = setTimeout(resolve, 200);
-                return;
-              }
               const eligible = status.tracked && status.text && hasCodePreview;
               setSupport(eligible ? 'yes' : 'no');
-              setFileInfo(eligible
-                ? { sessionId: parsed.sessionId, path: parsed.path, contentId: address, version: status.version || '' }
-                : null);
-            });
+              setFileInfo((prev) => {
+                if (!eligible) return null;
+                const version = status.version || '';
+                if (prev && prev.contentId === address && prev.version === version) return prev;
+                return { sessionId: parsed.sessionId, path: parsed.path, contentId: address, version };
+              });
+            })
+            .catch(() => {});
         };
-        resolve();
+
+        evaluate();
+        // Poll for branch switches / edits (version changes) while mounted.
+        pollTimer = setInterval(evaluate, 1500);
         return () => {
           active = false;
-          clearTimeout(retryTimer);
+          clearTimeout(debounce);
+          clearInterval(pollTimer);
+          if (observer) observer.disconnect();
         };
       }, []);
 
@@ -795,13 +812,17 @@ window.__ModuleLoader__.load({
                 // by (file + commit), so it stays valid for other rows of that commit.
                 let settledKey = cacheKey;
                 if (data && data.ok) {
-                  // Prefer the SHA the server actually blamed. If it differs from the
-                  // hint taken from the sidebar, the local row mapping was stale: drop
-                  // the poisoned hint entry so it cannot keep serving a wrong author.
+                  // Prefer the SHA the server actually blamed.
                   const actualKey = commitCacheKey(file.contentId, data.sha);
                   if (actualKey) {
+                    // Different real commit than the hint: drop the poisoned hint entry.
                     if (actualKey !== cacheKey) cacheRef.current.delete(cacheKey);
                     settledKey = actualKey;
+                  } else {
+                    // Uncommitted / unknown SHA: never share across lines, and never
+                    // leave this payload under a real commit's key.
+                    if (cacheKey !== key) cacheRef.current.delete(cacheKey);
+                    settledKey = key;
                   }
                   cacheSet(settledKey, data);
                 }
@@ -822,7 +843,7 @@ window.__ModuleLoader__.load({
               });
           };
 
-          const showLine = async (base, file, line, x, y, cacheKeyHint) => {
+          const showLine = async (base, file, line, x, y) => {
             const my = ++showSeqRef.current;
             const status = await fetchFileStatus(file);
             // Superseded by a newer line or by hiding.
@@ -835,9 +856,22 @@ window.__ModuleLoader__.load({
             const version = status.version;
             // Identity of the hovered line (used to detect "same hover target").
             const key = `${base}@${version}`;
-            // Blame data is shared per (file + commit): consecutive lines from the
-            // same commit reuse one cache entry, so moving across them never refetches.
-            const cacheKey = cacheKeyHint || key;
+            // Authoritative line -> SHA for THIS version: use the same whole-file
+            // mapping the gutter shows (shared cache), not the possibly stale
+            // `data-sha` on an already-rendered column. A branch switch or edit
+            // therefore re-resolves the line's commit instead of reusing the old one.
+            let lineSha = '';
+            try {
+              const lines = await fetchGutterLines({ ...file, version });
+              const entry = Array.isArray(lines) ? lines[line - 1] : undefined;
+              if (entry && typeof entry.sha === 'string') lineSha = entry.sha;
+            } catch (_error) {
+              lineSha = '';
+            }
+            if (my !== showSeqRef.current) return;
+            // A commit's message is shared across its rows; an uncommitted/all-zero
+            // (or unknown) SHA falls back to per-line identity.
+            const cacheKey = commitCacheKey(file.contentId, lineSha) || key;
             const cached = cacheGet(cacheKey);
             if (cached !== undefined) {
               publish({ key, base, cacheKey, x, y, line, status: 'ok', data: cached });
@@ -881,13 +915,10 @@ window.__ModuleLoader__.load({
               if (current.x !== x || current.y !== y) publish({ ...current, x, y });
               return;
             }
-            // Share one cache entry per (file + commit): rows from the same commit
-            // show instantly without refetching. Uncommitted rows (all-zero SHA)
-            // vary per line, so they fall back to per-line identity.
-            const sha = gutter.dataset.sha || '';
-            const cacheKeyHint = commitCacheKey(file.contentId, sha);
-            // Show immediately — no dwell delay when entering the gutter.
-            showLine(base, file, line, x, y, cacheKeyHint);
+            // Show immediately — no dwell delay when entering the gutter. The line's
+            // commit is resolved inside showLine from the whole-file mapping for the
+            // current version, so a stale `data-sha` on the DOM cannot mislead it.
+            showLine(base, file, line, x, y);
           };
 
           let lastMoveAt = 0;

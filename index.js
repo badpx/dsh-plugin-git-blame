@@ -7,7 +7,9 @@
  * commit message, and answer with small JSON describing the commit.
  */
 import path from 'node:path';
-import { promises as fsp } from 'node:fs';
+import os from 'node:os';
+import crypto from 'node:crypto';
+import { promises as fsp, constants as fsConstants } from 'node:fs';
 
 /** Route prefix; keep in sync with the Client half. */
 const ROUTE_PATH = '/plugin/git-blame';
@@ -124,6 +126,64 @@ async function isSafeRealFile(cwd, absolutePath) {
   }
 }
 
+/** Whether a buffer's first 8 KiB look like text (no NUL, few control bytes). */
+function looksTextBuffer(buffer) {
+  if (!buffer || buffer.length === 0) return true;
+  const slice = buffer.subarray(0, 8192);
+  if (slice.includes(0)) return false;
+  let control = 0;
+  for (const byte of slice) {
+    if (byte < 9 || (byte > 13 && byte < 32)) control += 1;
+  }
+  return control / slice.length < 0.3;
+}
+
+/** Stable content fingerprint of a file's bytes. */
+function contentHash(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+/**
+ * Open the file safely (no symlink at the final component) and read it through
+ * that single descriptor: `fstat` confirms a regular file, `realpath` confirms it
+ * stays in the session directory, and the bytes used for text detection and the
+ * content hash come from the descriptor, not a re-openable path. This closes the
+ * check-then-swap race where the path is replaced by a symlink after validation.
+ * @returns {Promise<{ ok: boolean, buffer?: Buffer, text?: boolean }>}
+ */
+async function readSafeFile(cwd, absolutePath) {
+  let handle;
+  try {
+    handle = await fsp.open(absolutePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    const stats = await handle.stat();
+    if (!stats.isFile()) return { ok: false };
+    const real = await fsp.realpath(absolutePath);
+    const root = await fsp.realpath(path.resolve(cwd));
+    if (real !== root && !real.startsWith(root + path.sep)) return { ok: false };
+    const buffer = await handle.readFile();
+    return { ok: true, buffer, text: looksTextBuffer(buffer) };
+  } catch {
+    return { ok: false };
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
+/**
+ * Snapshot version = HEAD commit + content fingerprint of the safe-read bytes.
+ * Both a branch switch (HEAD changes) and an edit (bytes change) invalidate it.
+ * @returns {Promise<string>}
+ */
+async function snapshotVersion(ctx, cwd, safe, options = {}) {
+  const headResult = await runGit(ctx, cwd, ['git', '-C', cwd, 'rev-parse', '--verify', 'HEAD'], {
+    signal: options.signal,
+    maxStdoutBytes: 4096,
+  });
+  const head = headResult.ok && !headResult.stdoutLossy ? headResult.stdout.trim() : '';
+  const fingerprint = safe && safe.buffer ? contentHash(safe.buffer) : '';
+  return `${head}:${fingerprint}`;
+}
+
 /**
  * Run one managed git command and collect its output.
  * @returns {Promise<{ ok: boolean, exitCode?: number | null, stdout: string, stderr: string,
@@ -237,14 +297,9 @@ async function commitMessage(ctx, cwd, sha, options = {}) {
  * @returns {Promise<string>}
  */
 async function fileVersion(ctx, cwd, absolutePath, options = {}) {
-  const signal = options.signal;
-  const [blobResult, headResult] = await Promise.all([
-    runGit(ctx, cwd, ['git', '-C', cwd, 'hash-object', '--', absolutePath], { signal, maxStdoutBytes: 4096 }),
-    runGit(ctx, cwd, ['git', '-C', cwd, 'rev-parse', '--verify', 'HEAD'], { signal, maxStdoutBytes: 4096 }),
-  ]);
-  const blob = blobResult.ok && !blobResult.stdoutLossy ? blobResult.stdout.trim() : '';
-  const head = headResult.ok && !headResult.stdoutLossy ? headResult.stdout.trim() : '';
-  return `${head}:${blob}`;
+  const safe = await readSafeFile(cwd, absolutePath);
+  if (!safe.ok) return '';
+  return snapshotVersion(ctx, cwd, safe, options);
 }
 
 /**
@@ -361,41 +416,58 @@ function parseFullPorcelain(text) {
 }
 
 /**
+ * Run `fn` with a temporary file holding `buffer` (mode 0600, removed afterwards).
+ * When `buffer` is absent, `fn` runs with `undefined` so git reads the path itself
+ * (used by unit tests on trusted temp repos).
+ * @returns {Promise<*>}
+ */
+async function withContentsFile(buffer, fn) {
+  if (!buffer) return fn(undefined);
+  const file = path.join(os.tmpdir(), `dsh-blame-${process.pid}-${crypto.randomBytes(8).toString('hex')}`);
+  await fsp.writeFile(file, buffer, { mode: 0o600, flag: 'wx' });
+  try {
+    return await fn(file);
+  } finally {
+    await fsp.unlink(file).catch(() => {});
+  }
+}
+
+/**
  * Blame the whole file, returning a per-line array of commit summaries.
  * @returns {Promise<Record<string, unknown>>}
  */
 async function blameFile(ctx, cwd, absolutePath, options = {}) {
-  const result = await runGit(
-    ctx,
-    cwd,
-    ['git', '-C', cwd, 'blame', '--line-porcelain', '--', absolutePath],
-    { signal: options.signal, maxStdoutBytes: 32 * 1024 * 1024 },
-  );
-  if (result.exitCode === undefined) {
-    return { ok: false, code: 'spawn-failed', message: result.message };
-  }
-  if (result.timedOut) return { ok: false, code: 'timeout', message: 'git blame timed out' };
-  if (result.stdoutLossy) {
-    return { ok: false, code: 'truncated', message: 'git blame output exceeded the size limit' };
-  }
-  if (!result.ok) {
-    const message = result.stderr.trim() || result.stdout.trim() || 'git blame failed';
-    if (/not a git repository/i.test(message)) {
-      return { ok: false, code: 'not-repo', message: 'This file is not inside a Git repository' };
+  return withContentsFile(options.contentsBuffer, async (contentsPath) => {
+    const argv = ['git', '-C', cwd, 'blame', '--line-porcelain'];
+    if (contentsPath) argv.push('--contents', contentsPath);
+    argv.push('--', absolutePath);
+    const result = await runGit(ctx, cwd, argv, { signal: options.signal, maxStdoutBytes: 32 * 1024 * 1024 });
+    if (result.exitCode === undefined) {
+      return { ok: false, code: 'spawn-failed', message: result.message };
     }
-    if (/no such path|does not exist in/i.test(message)) {
-      return { ok: false, code: 'not-tracked', message: 'File is not tracked by Git' };
+    if (result.timedOut) return { ok: false, code: 'timeout', message: 'git blame timed out' };
+    if (result.stdoutLossy) {
+      return { ok: false, code: 'truncated', message: 'git blame output exceeded the size limit' };
     }
-    return { ok: false, code: 'git-failed', message: message.split('\n')[0] };
-  }
-  const parsed = parseFullPorcelain(result.stdout);
-  if (parsed.parsedCount === 0 && result.stdout.trim() !== '') {
-    return { ok: false, code: 'parse-failed', message: 'git blame returned an unexpected output' };
-  }
-  if (parsed.lines.length > MAX_BLAME_FILE_LINES) {
-    return { ok: false, code: 'too-large', message: 'File is too large for inline blame' };
-  }
-  return { ok: true, lines: parsed.lines };
+    if (!result.ok) {
+      const message = result.stderr.trim() || result.stdout.trim() || 'git blame failed';
+      if (/not a git repository/i.test(message)) {
+        return { ok: false, code: 'not-repo', message: 'This file is not inside a Git repository' };
+      }
+      if (/no such path|does not exist in/i.test(message)) {
+        return { ok: false, code: 'not-tracked', message: 'File is not tracked by Git' };
+      }
+      return { ok: false, code: 'git-failed', message: message.split('\n')[0] };
+    }
+    const parsed = parseFullPorcelain(result.stdout);
+    if (parsed.parsedCount === 0 && result.stdout.trim() !== '') {
+      return { ok: false, code: 'parse-failed', message: 'git blame returned an unexpected output' };
+    }
+    if (parsed.lines.length > MAX_BLAME_FILE_LINES) {
+      return { ok: false, code: 'too-large', message: 'File is too large for inline blame' };
+    }
+    return { ok: true, lines: parsed.lines };
+  });
 }
 
 /**
@@ -403,47 +475,47 @@ async function blameFile(ctx, cwd, absolutePath, options = {}) {
  * @returns {Promise<Record<string, unknown>>}
  */
 async function blameLine(ctx, cwd, absolutePath, line, options = {}) {
-  const result = await runGit(
-    ctx,
-    cwd,
-    ['git', '-C', cwd, 'blame', '--line-porcelain', '-L', `${line},${line}`, '--', absolutePath],
-    { signal: options.signal },
-  );
+  return withContentsFile(options.contentsBuffer, async (contentsPath) => {
+    const argv = ['git', '-C', cwd, 'blame', '--line-porcelain', '-L', `${line},${line}`];
+    if (contentsPath) argv.push('--contents', contentsPath);
+    argv.push('--', absolutePath);
+    const result = await runGit(ctx, cwd, argv, { signal: options.signal });
 
-  if (result.exitCode === undefined) {
-    return { ok: false, code: 'spawn-failed', message: result.message };
-  }
-  if (result.timedOut) return { ok: false, code: 'timeout', message: 'git blame timed out' };
-  if (result.stdoutLossy) {
-    return { ok: false, code: 'truncated', message: 'git blame output exceeded the size limit' };
-  }
-  if (!result.ok) {
-    const message = result.stderr.trim() || result.stdout.trim() || 'git blame failed';
-    if (/not a git repository/i.test(message)) {
-      return { ok: false, code: 'not-repo', message: 'This file is not inside a Git repository' };
+    if (result.exitCode === undefined) {
+      return { ok: false, code: 'spawn-failed', message: result.message };
     }
-    if (/no such path|does not exist in|has only \d+ lines?/i.test(message)) {
-      return { ok: false, code: 'not-tracked', message: 'File is not tracked by Git or the line does not exist' };
+    if (result.timedOut) return { ok: false, code: 'timeout', message: 'git blame timed out' };
+    if (result.stdoutLossy) {
+      return { ok: false, code: 'truncated', message: 'git blame output exceeded the size limit' };
     }
-    return { ok: false, code: 'git-failed', message: message.split('\n')[0] };
-  }
+    if (!result.ok) {
+      const message = result.stderr.trim() || result.stdout.trim() || 'git blame failed';
+      if (/not a git repository/i.test(message)) {
+        return { ok: false, code: 'not-repo', message: 'This file is not inside a Git repository' };
+      }
+      if (/no such path|does not exist in|has only \d+ lines?/i.test(message)) {
+        return { ok: false, code: 'not-tracked', message: 'File is not tracked by Git or the line does not exist' };
+      }
+      return { ok: false, code: 'git-failed', message: message.split('\n')[0] };
+    }
 
-  const info = parsePorcelain(result.stdout);
-  if (!info.ok) return info;
+    const info = parsePorcelain(result.stdout);
+    if (!info.ok) return info;
 
-  if (info.uncommitted) {
-    info.author = info.author || 'Uncommitted change';
-    info.message = '';
-    info.title = 'Uncommitted change';
-    info.body = 'Working tree changes not yet committed';
+    if (info.uncommitted) {
+      info.author = info.author || 'Uncommitted change';
+      info.message = '';
+      info.title = 'Uncommitted change';
+      info.body = 'Working tree changes not yet committed';
+      return info;
+    }
+
+    info.message = await commitMessage(ctx, cwd, info.sha, { signal: options.signal });
+    const split = splitMessage(info.message, info.summary);
+    info.title = split.title;
+    info.body = split.body;
     return info;
-  }
-
-  info.message = await commitMessage(ctx, cwd, info.sha, { signal: options.signal });
-  const split = splitMessage(info.message, info.summary);
-  info.title = split.title;
-  info.body = split.body;
-  return info;
+  });
 }
 
 /**
@@ -482,7 +554,11 @@ async function handleRequest(ctx, req, res) {
       return;
     }
 
-    if (!(await isSafeRealFile(cwd, absolutePath))) {
+    // One safe open: the same descriptor supplies validation, text detection, the
+    // content hash, and the blame input, so a path swapped after the check cannot
+    // make git read a different (possibly outside) file.
+    const safe = await readSafeFile(cwd, absolutePath);
+    if (!safe.ok) {
       if (isStatusRequest) {
         // Not eligible (symlink/non-regular/missing): answer a settled "no" so the
         // client stops polling instead of retrying forever.
@@ -497,14 +573,14 @@ async function handleRequest(ctx, req, res) {
       const relative = path.relative(cwd, absolutePath) || path.basename(absolutePath);
       const trackedResult = await runGit(ctx, cwd, ['git', '-C', cwd, 'ls-files', '--error-unmatch', '--', relative], { signal });
       const tracked = trackedResult.ok;
-      const text = await isProbablyText(absolutePath);
-      const version = tracked ? await fileVersion(ctx, cwd, absolutePath, { signal }) : '';
+      const text = isTextExtension(absolutePath) && safe.text;
+      const version = tracked ? await snapshotVersion(ctx, cwd, safe, { signal }) : '';
       sendJson(res, 200, { ok: true, tracked, text, version });
       return;
     }
 
     if (isFileRequest) {
-      const fileResult = await blameFile(ctx, cwd, absolutePath, { signal });
+      const fileResult = await blameFile(ctx, cwd, absolutePath, { signal, contentsBuffer: safe.buffer });
       sendJson(res, 200, fileResult);
       return;
     }
@@ -516,9 +592,9 @@ async function handleRequest(ctx, req, res) {
     }
 
     const providedVersion = url.searchParams.get('version') || '';
-    const result = await blameLine(ctx, cwd, absolutePath, line, { signal });
+    const result = await blameLine(ctx, cwd, absolutePath, line, { signal, contentsBuffer: safe.buffer });
     if (result.ok) {
-      result.version = providedVersion || await fileVersion(ctx, cwd, absolutePath, { signal });
+      result.version = providedVersion || await snapshotVersion(ctx, cwd, safe, { signal });
     }
     sendJson(res, 200, result);
   } catch (error) {
@@ -542,10 +618,15 @@ export function apply(ctx) {
 // Internals exported for regression tests. The plugin loader only uses `inject`
 // and `apply`; extra named exports are inert.
 export {
+  handleRequest,
   runGit,
   resolveFile,
   isSafeRealFile,
   isProbablyText,
+  looksTextBuffer,
+  contentHash,
+  readSafeFile,
+  snapshotVersion,
   fileVersion,
   commitMessage,
   parsePorcelain,
