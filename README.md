@@ -44,7 +44,9 @@ toggle's tooltip.
   movement it fades over 1 s to opacity 0.15 so it stops hiding the code below;
   any pointer movement restores it.
 - The commit message is shown as a bold first-line title plus a normal body; the
-  body is capped at 5 lines and ends with an ellipsis when truncated.
+  body is capped at 5 lines and ends with an ellipsis when truncated. When a
+  commit has only a single-line message, that line wraps and uses the full
+  5-line budget instead of being clamped to one line.
 - Blame is shared per file+commit: consecutive rows belonging to the same commit
   reuse a single cache entry, so moving the pointer across them is instant and
   triggers no reload. Uncommitted rows keep per-line caching.

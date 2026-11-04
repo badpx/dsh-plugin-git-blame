@@ -388,6 +388,10 @@ window.__ModuleLoader__.load({
       const data = tip.data || {};
       const title = data.title || data.summary || '';
       const messageBody = data.body || '';
+      // When the commit message is a single line it becomes the title; let that
+      // lone line wrap and use the whole message line budget instead of being
+      // truncated to one line.
+      const titleOnly = Boolean(title) && !messageBody;
 
       const message = (title || messageBody)
         ? h('div', {
@@ -396,14 +400,27 @@ window.__ModuleLoader__.load({
         title
           ? h('div', {
             title: title,
-            style: {
-              fontSize: '12px',
-              fontWeight: 700,
-              color: 'var(--dsw-alias-label-primary)',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            },
+            style: titleOnly
+              ? {
+                fontSize: '12px',
+                fontWeight: 700,
+                color: 'var(--dsw-alias-label-primary)',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                display: '-webkit-box',
+                WebkitLineClamp: MAX_BODY_LINES,
+                WebkitBoxOrient: 'vertical',
+              }
+              : {
+                fontSize: '12px',
+                fontWeight: 700,
+                color: 'var(--dsw-alias-label-primary)',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              },
           }, title)
           : null,
         messageBody
