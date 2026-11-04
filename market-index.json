@@ -20,12 +20,8 @@
       "versions": [
         {
           "version": "0.2.0",
-          "publishTimestamp": 1793805648,
-          "source": {
-            "type": "git",
-            "url": "https://github.com/badpx/dsh-plugin-git-blame",
-            "commit": "f7d51592ac7dc2c863a321a188ced04df83fbd23"
-          },
+          "publishTimestamp": 1793806000,
+          "source": { "type": "npm" },
           "engines": { "dsh": "^0.2.1-rc.5" }
         },
         {
