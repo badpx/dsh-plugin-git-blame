@@ -19,7 +19,8 @@
     "locale/en.json",
     "locale/zh.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "README.zh.md"
   ],
   "keywords": [
     "dsh-plugin",

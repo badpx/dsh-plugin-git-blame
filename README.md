@@ -1,5 +1,7 @@
 # Git Blame on Hover
 
+English | [中文](https://github.com/badpx/dsh-plugin-git-blame/blob/main/README.zh.md)
+
 A DeepSeek Harness plugin. When a text or source file is opened in the right
 sidebar's file preview, hovering a line shows a small card with that line's
 `git blame` information (author, short commit hash, date, and commit summary).
