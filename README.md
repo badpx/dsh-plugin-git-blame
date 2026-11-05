@@ -4,6 +4,8 @@ A DeepSeek Harness plugin. When a text or source file is opened in the right
 sidebar's file preview, hovering a line shows a small card with that line's
 `git blame` information (author, short commit hash, date, and commit summary).
 
+![Inline git blame gutter and hover bubble in the right-sidebar file preview](https://raw.githubusercontent.com/badpx/dsh-plugin-git-blame/main/screenshot.png)
+
 ## Install
 
 Requires DeepSeek Harness; this plugin targets DSH `^0.2.1-rc.5`.
