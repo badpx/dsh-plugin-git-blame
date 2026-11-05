@@ -24,7 +24,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/badpx/dsh-plugin-git-blame",
-            "commit": "490310519b6c9a5ba713f7fe05322138bad76352"
+            "commit": "74fc645a71797d4777d8b306c4d4bcc9b5b9a754"
           },
           "engines": { "dsh": "^0.2.1-rc.5" }
         },
