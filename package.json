@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-git-blame",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Hover the blame gutter in a right-sidebar file preview to see each line's git blame.",
   "type": "module",
   "scripts": {

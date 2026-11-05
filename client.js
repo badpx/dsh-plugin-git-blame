@@ -354,7 +354,9 @@ window.__ModuleLoader__.load({
         authorElement.className = 'gb-author';
         authorElement.textContent = authorText;
         span.append(dateElement, authorElement);
-        span.title = info.uncommitted ? '未提交的更改' : `${dateText} ${authorText} ${info.shortSha || ''}`.trim();
+        // The hover bubble is the single place that shows blame details. Clear any
+        // native `title` so the browser tooltip cannot overlap the bubble.
+        span.removeAttribute('title');
       });
     }
 
