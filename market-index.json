@@ -19,6 +19,16 @@
       "icon": "https://raw.githubusercontent.com/badpx/dsh-plugin-git-blame/main/icon.svg",
       "versions": [
         {
+          "version": "0.2.1",
+          "publishTimestamp": 1793846104,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/badpx/dsh-plugin-git-blame",
+            "commit": "490310519b6c9a5ba713f7fe05322138bad76352"
+          },
+          "engines": { "dsh": "^0.2.1-rc.5" }
+        },
+        {
           "version": "0.2.0",
           "publishTimestamp": 1793806000,
           "source": { "type": "npm" },
