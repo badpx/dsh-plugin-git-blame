@@ -341,6 +341,10 @@ window.__ModuleLoader__.load({
         }
         const dateText = formatGutterDate(info.date);
         const authorText = info.uncommitted ? '未提交' : (info.author || '');
+        // The hover bubble is the single place that shows blame details. Clear any
+        // native `title` (also on rows whose signature did not change) so the
+        // browser tooltip cannot overlap the bubble.
+        span.removeAttribute('title');
         const signature = `${info.sha || ''}|${dateText}|${authorText}`;
         if (span.dataset.sig === signature) return;
         span.dataset.sig = signature;
@@ -354,9 +358,6 @@ window.__ModuleLoader__.load({
         authorElement.className = 'gb-author';
         authorElement.textContent = authorText;
         span.append(dateElement, authorElement);
-        // The hover bubble is the single place that shows blame details. Clear any
-        // native `title` so the browser tooltip cannot overlap the bubble.
-        span.removeAttribute('title');
       });
     }
 
