@@ -106,25 +106,6 @@ toggle's tooltip.
 - Blame is shared per file+commit: consecutive rows belonging to the same commit
   reuse a single cache entry, so moving the pointer across them is instant and
   triggers no reload. Uncommitted rows keep per-line caching.
-
-## Caching
-
-- **Whole-file blame cache (`gutterCache`)**: an in-memory LRU keyed by
-  `file address + snapshot version`, holding the parsed per-line array the gutter
-  renders. Bounded by a **64 MB byte budget, at most 200 entries**, and a single
-  file whose line data exceeds 16 MB is not cached; least-recently-used entries
-  are evicted (no clear-all cliff). Concurrent reads of the same file+version are
-  coalesced into one request, and the bubble reuses the mapping the sidebar already
-  holds — so even a too-large-to-cache file never refetches blame per hover.
-- **Client bubble cache**: a bounded LRU (2000 entries, 600 s TTL). For committed
-  rows the key is `file address + commit SHA`, so every row of one commit shares
-  a single entry and moving the pointer across those rows is instant (no reload).
-  Uncommitted rows are keyed by `file address + content version + line`. The
-  snapshot version is `HEAD + file size + mtime + ctime` from one safe open (reused
-  for ~1 s), and the host confirms HEAD is unchanged across the read and blame, so
-  switching branches or editing shifts each line to the right commit and stale
-  blame is never served — without hashing whole files on every probe.
-- **Host commit-message cache**: keyed by full commit SHA with a 500-entry LRU.
-  Failures are never cached, so a transient `git show` error is retried.
 - Files outside a Git repository, or lines that are not tracked, show a short
   explanatory message instead of a commit.
+
